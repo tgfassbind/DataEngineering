@@ -15,4 +15,4 @@ dataengineering/
 ```
 
 ## Project plan
-The project plan is using GitHubs Issues function. Backlog items are found there. 
+The project plan uses GitHub's Issues feature for backlog items; a written overview can also be found under docs.
