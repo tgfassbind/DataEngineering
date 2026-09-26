@@ -1,0 +1,5 @@
+# root level
+.env
+
+# any sub-directories
+**/.env
