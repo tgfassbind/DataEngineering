@@ -1,5 +1,5 @@
 # DENG HS2026
-This is the Data Engineering project repository for group #.
+This is the Data Engineering project repository for group 01.
 
 The group members are:
 * Til Fassbind
