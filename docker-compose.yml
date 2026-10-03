@@ -1,0 +1,57 @@
+name: deng-datapipeline
+
+services:
+  object-storage:
+    image: chrislusf/seaweedfs:4.48
+    command:
+      - mini
+      - -dir=/data
+      - -webdav=false
+      - -admin.ui=false
+      - -s3.port.iceberg=0
+      - -s3.port.lance=0
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?copy .env.example to .env}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?copy .env.example to .env}
+      S3_BUCKET: ${S3_BUCKET:-sbb-ist-daten}
+    ports:
+      - "127.0.0.1:${S3_API_PORT:-8333}:8333"   # S3 API, localhost only
+    volumes:
+      - storage-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [deng-datapipeline]
+
+  fetcher:
+    build: ./fetcher
+    image: deng-datapipeline/fetcher:1.0.0
+    profiles: ["jobs"]
+    depends_on:
+      object-storage:
+        condition: service_healthy
+    environment:
+      # no ":" -> an explicitly EMPTY value is kept (= real AWS S3)
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL-http://object-storage:8333}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?copy .env.example to .env}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?copy .env.example to .env}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-sbb-ist-daten}
+      S3_CREATE_BUCKET: ${S3_CREATE_BUCKET:-false}
+      S3_BUCKET_WAIT_SECONDS: ${S3_BUCKET_WAIT_SECONDS:-60}
+      PERMALINK_URL_TEMPLATE: ${PERMALINK_URL_TEMPLATE:-}
+      ARCHIVE_URL_TEMPLATE: ${ARCHIVE_URL_TEMPLATE:-}
+      HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-120}
+      FETCHER_TIMEZONE: ${FETCHER_TIMEZONE:-Europe/Zurich}
+      FETCHER_REFERENCE_DATE: ${FETCHER_REFERENCE_DATE:-}
+    volumes:
+      - /tmp/fetcher   # anonymous volume: archive ZIP scratch space, removed by --rm
+    networks: [deng-datapipeline]
+
+networks:
+  deng-datapipeline:   # bridge network: fetcher <-> object-storage, plus outbound internet
+
+volumes:
+  storage-data:
