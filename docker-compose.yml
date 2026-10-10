@@ -50,8 +50,92 @@ services:
       - /tmp/fetcher   # anonymous volume: archive ZIP scratch space, removed by --rm
     networks: [deng-datapipeline]
 
+  transform:
+    build: ./transform
+    image: deng-datapipeline/transform:1.0.0
+    profiles: ["jobs"]
+    depends_on:
+      object-storage:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+    environment:
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL-http://object-storage:8333}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?copy .env.example to .env}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?copy .env.example to .env}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-sbb-ist-daten}
+      S3_BUCKET_WAIT_SECONDS: ${S3_BUCKET_WAIT_SECONDS:-60}
+      POSTGRES_HOST: ${POSTGRES_HOST:-database}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-sbb-ist-daten}
+      POSTGRES_USER: ${POSTGRES_USER:?copy .env.example to .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      TRANSFORM_LINES_FILE: ${TRANSFORM_LINES_FILE:-}
+      TRANSFORM_CHUNK_SIZE: ${TRANSFORM_CHUNK_SIZE:-100000}
+      TRANSFORM_MAX_ABS_DELAY_S: ${TRANSFORM_MAX_ABS_DELAY_S:-10800}
+      TRANSFORM_MAX_SEGMENT_DURATION_S: ${TRANSFORM_MAX_SEGMENT_DURATION_S:-21600}
+    volumes:
+      - ./transform/config:/opt/transform/config:ro   # versioned line selection
+      - ./dataset:/opt/transform/dataset:ro           # fixture for app.seed
+    # hard memory limit: the job streams in chunks and must fit (peak ~360 MiB
+    # for a 3-million-row day at the default chunk size)
+    mem_limit: ${TRANSFORM_MEM_LIMIT:-1g}
+    networks: [deng-datapipeline]
+
+  database:
+    image: postgres:16.10-bookworm
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?copy .env.example to .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      POSTGRES_DB: ${POSTGRES_DB:-sbb-ist-daten}
+    ports:
+      # published for external queries (psql, BI tools); 127.0.0.1 = this machine only
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # schemas + staging table; runs only when db-data is empty
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # -h 127.0.0.1: TCP only answers once the init scripts are done
+      # (during init the server listens on the unix socket only)
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+    networks: [deng-datapipeline]
+
+  pgadmin:
+    # optional web UI to look at the data: docker compose --profile tools up -d pgadmin
+    image: dpage/pgadmin4:9.18.0
+    profiles: ["tools"]
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:?copy .env.example to .env}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?copy .env.example to .env}
+      PGADMIN_SERVER_JSON_FILE: /tmp/servers.json
+      PGADMIN_DISABLE_POSTFIX: "true"     # no mail server needed
+      POSTGRES_DB: ${POSTGRES_DB:-sbb-ist-daten}
+      POSTGRES_USER: ${POSTGRES_USER:?copy .env.example to .env}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        printf '{"Servers":{"1":{"Name":"SBB Ist-Daten","Group":"DENG","Host":"database","Port":5432,"MaintenanceDB":"%s","Username":"%s","SSLMode":"prefer"}}}' "$$POSTGRES_DB" "$$POSTGRES_USER" > /tmp/servers.json
+        exec /entrypoint.sh
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5050}:80"   # http://localhost:5050, this machine only
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin   # pgAdmin settings, saved passwords, query history
+    networks: [deng-datapipeline]
+
 networks:
-  deng-datapipeline:   # bridge network: fetcher <-> object-storage, plus outbound internet
+  deng-datapipeline:
 
 volumes:
   storage-data:
+  db-data:
+  pgadmin-data:
