@@ -1,0 +1,3 @@
+# Test-only dependencies: none beyond the runtime set.
+# The e2e tests talk to the real object storage and PostgreSQL services.
+-r requirements.txt

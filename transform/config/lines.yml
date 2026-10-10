@@ -1,0 +1,16 @@
+# Lines the transform job keeps (everything else in the daily file is dropped).
+# Versioned on purpose: the selection is part of what makes a run reproducible.
+#
+# A line is identified by LINIEN_TEXT *and* BETREIBER_ABK, because LINIEN_TEXT
+# alone is not unique ("S1" exists in several S-Bahn networks).
+#
+# Override per run:      --lines IR75:SBB,S1:SBB
+# Use another file:      TRANSFORM_LINES_FILE=/path/to/lines.yml
+# Precedence:            --lines  >  TRANSFORM_LINES_FILE  >  this file
+lines:
+  - linien_text: IR75
+    betreiber_abk: SBB
+    via_bpuic: [8502202]
+  - linien_text: S1
+    betreiber_abk: SBB
+    via_bpuic: [8502202]
