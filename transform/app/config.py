@@ -178,7 +178,7 @@ class Config:
             s3_bucket_wait_s=_env_int("S3_BUCKET_WAIT_SECONDS", 60, minimum=0),
             pg_host=_env("POSTGRES_HOST", "database"),
             pg_port=_env_int("POSTGRES_PORT", 5432),
-            pg_db=_env("POSTGRES_DB", "travelbuddy"),
+            pg_db=_env("POSTGRES_DB", "deng"),
             pg_user=_env("POSTGRES_USER", required=True),
             pg_password=_env("POSTGRES_PASSWORD", required=True),
             chunk_size=_env_int("TRANSFORM_CHUNK_SIZE", DEFAULT_CHUNK_SIZE),

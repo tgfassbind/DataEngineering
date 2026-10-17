@@ -261,7 +261,7 @@ docker compose run --rm transform --date 2026-09-21
 
 # 3. look at the result (any PostgreSQL client works, port 5432 on localhost;
 #    adjust -U / -d if you changed POSTGRES_USER / POSTGRES_DB)
-docker compose exec database psql -U deng -d travelbuddy \
+docker compose exec database psql -U deng -d deng \
     -c "SELECT count(*), count(arr_delay_s), count(dep_delay_s) FROM staging.stop_events"
 #  count | count | count
 #    445 |   377 |   394
@@ -281,7 +281,7 @@ Open http://localhost:5050 and log in with `PGADMIN_DEFAULT_EMAIL` /
 already registered (host `database`, user `POSTGRES_USER`, database
 `POSTGRES_DB`). On the first connect pgAdmin asks for `POSTGRES_PASSWORD`; tick
 "Save password" to skip that next time. The data is under
-*Databases → sub_ist_daten → Schemas → staging → Tables → stop_events*.
+*Databases → deng → Schemas → staging → Tables → stop_events*.
 
 * pgAdmin is not part of the pipeline: it only starts with `--profile tools`,
   and `docker compose down` stops it like everything else.
@@ -432,7 +432,7 @@ Set in `.env` (template: `.env.example`). The `S3_*` variables are shared with t
 | `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_REGION`, `S3_BUCKET` | see fetcher | where the raw files are |
 | `S3_BUCKET_WAIT_SECONDS` | 60 | how long to wait for the bucket after storage starts (first run of a fresh clone) |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD` | **required** | database credentials (used by the database service *and* the transform) |
-| `POSTGRES_DB` | `sbb-ist-daten` | database name |
+| `POSTGRES_DB` | `deng` | database name |
 | `POSTGRES_HOST`, `POSTGRES_PORT` | `database`, 5432 | how the transform reaches the database inside the Docker network |
 | `POSTGRES_BIND_ADDRESS`, `POSTGRES_HOST_PORT` | `127.0.0.1`, 5432 | where the database is published on your machine for external queries |
 | `PGADMIN_DEFAULT_EMAIL`, `PGADMIN_DEFAULT_PASSWORD` | **required** (placeholders in `.env.example`) | pgAdmin login |
@@ -503,7 +503,7 @@ docker compose up -d object-storage database
 E2E_S3_ENDPOINT=http://127.0.0.1:8333 E2E_S3_ACCESS_KEY_ID=<from .env> \
 E2E_S3_SECRET_ACCESS_KEY=<from .env> E2E_POSTGRES_HOST=127.0.0.1 \
 E2E_POSTGRES_PORT=5432 E2E_POSTGRES_USER=<from .env> E2E_POSTGRES_PASSWORD=<from .env> \
-E2E_POSTGRES_DB=travelbuddy python -m unittest tests.test_e2e -v
+E2E_POSTGRES_DB=deng python -m unittest tests.test_e2e -v
 ```
 
 The e2e tests create their own bucket and database and remove them afterwards.

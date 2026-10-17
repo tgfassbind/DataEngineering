@@ -9,7 +9,7 @@ and these variables (values from your .env):
     E2E_S3_ENDPOINT=http://127.0.0.1:8333
     E2E_S3_ACCESS_KEY_ID=...   E2E_S3_SECRET_ACCESS_KEY=...
     E2E_POSTGRES_HOST=127.0.0.1  E2E_POSTGRES_PORT=5432
-    E2E_POSTGRES_USER=...      E2E_POSTGRES_PASSWORD=...  E2E_POSTGRES_DB=travelbuddy
+    E2E_POSTGRES_USER=...      E2E_POSTGRES_PASSWORD=...  E2E_POSTGRES_DB=deng
 
 Without them the tests are skipped. Isolation: the tests create their own
 bucket and their own database (from db/init/01_schemas.sql) and remove both

@@ -68,7 +68,7 @@ services:
       S3_BUCKET_WAIT_SECONDS: ${S3_BUCKET_WAIT_SECONDS:-60}
       POSTGRES_HOST: ${POSTGRES_HOST:-database}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      POSTGRES_DB: ${POSTGRES_DB:-sbb-ist-daten}
+      POSTGRES_DB: ${POSTGRES_DB:-deng}
       POSTGRES_USER: ${POSTGRES_USER:?copy .env.example to .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
       TRANSFORM_LINES_FILE: ${TRANSFORM_LINES_FILE:-}
@@ -88,7 +88,7 @@ services:
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?copy .env.example to .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
-      POSTGRES_DB: ${POSTGRES_DB:-sbb-ist-daten}
+      POSTGRES_DB: ${POSTGRES_DB:-deng}
     ports:
       # published for external queries (psql, BI tools); 127.0.0.1 = this machine only
       - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_HOST_PORT:-5432}:5432"
@@ -118,7 +118,7 @@ services:
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?copy .env.example to .env}
       PGADMIN_SERVER_JSON_FILE: /tmp/servers.json
       PGADMIN_DISABLE_POSTFIX: "true"     # no mail server needed
-      POSTGRES_DB: ${POSTGRES_DB:-sbb-ist-daten}
+      POSTGRES_DB: ${POSTGRES_DB:-deng}
       POSTGRES_USER: ${POSTGRES_USER:?copy .env.example to .env}
     entrypoint:
       - /bin/sh
