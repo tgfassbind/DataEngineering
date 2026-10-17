@@ -26,3 +26,6 @@ virtualenv/
 .VolumeIcon.icns
 .com.apple.timemachine.donotpresent
 Icon?
+
+# test cache
+db/tests/__pycache__
