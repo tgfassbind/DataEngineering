@@ -1,0 +1,226 @@
+# The pipeline engine: fetch -> transform -> aggregate for one date range.
+# Fetch and transform run as `docker compose run --rm <service>`
+#
+# Loaded automatically at Kestra startup from orchestrator/flows/ (--flow-path).
+# Edits made in the UI are overwritten at the next start of the kestra container.
+#
+# Exit codes of the job containers (see fetcher/app/cli.py, transform/app/cli.py):
+#   0 = all days OK, 1 = at least one day FAILED, 2 = invalid arguments/configuration.
+id: backfill
+namespace: deng
+description: |
+  Fetch, transform and aggregate SBB Ist-Daten for an inclusive date range.
+
+  * `full`: fetch (`--start-date/--end-date`) -> transform (upsert) -> `CALL reporting.refresh_od_delay()`
+  * `fetch_only`: fetch only (staging and reporting untouched)
+  * `transform_only`: transform with `--retransform` -> aggregation (raw files untouched)
+
+  The raw files in object storage are only replaced with `force_overwrite: true`.
+
+labels:
+  project: deng
+
+# One pipeline run at a time (daily + manual backfills queue up)
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+inputs:
+  - id: start_date
+    type: DATE
+    displayName: Start date (YYYY-MM-DD)
+    description: First operating day, inclusive.
+
+  - id: end_date
+    type: DATE
+    displayName: End date (YYYY-MM-DD)
+    description: Last operating day, inclusive. Must be >= start_date and not after today (Europe/Zurich).
+
+  - id: mode
+    type: SELECT
+    displayName: Mode
+    values:
+      - full
+      - fetch_only
+      - transform_only
+    defaults: full
+
+  - id: force_overwrite
+    type: BOOL
+    displayName: Force overwrite raw files
+    description: Passed to the fetcher as --force-overwrite (re-download days that are already stored). Ignored in transform_only.
+    defaults: false
+
+  - id: lines
+    type: STRING
+    displayName: Lines override (optional)
+    description: |
+      Passed to the transform as --lines, e.g. `IR75:SBB,S1:SBB` or `S1:SBB@8502202`.
+      Empty = transform/config/lines.yml. The fixture acceptance numbers (445 rows / 1914 rows) need `IR75:SBB,S1:SBB`.
+    required: false
+    validator: "^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+(@[0-9]+(\\+[0-9]+)*)?(,[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+(@[0-9]+(\\+[0-9]+)*)?)*$"
+
+variables:
+  fetcher_image: deng-datapipeline/fetcher:1.0.0
+  transform_image: deng-datapipeline/transform:1.0.0
+  compose_image: docker:27.5.1-cli
+
+tasks:
+  # validation
+  - id: label_run
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      mode: "{{ inputs.mode }}"
+      start_date: "{{ inputs.start_date | date('yyyy-MM-dd') }}"
+      end_date: "{{ inputs.end_date | date('yyyy-MM-dd') }}"
+
+  - id: check_range
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ (inputs.end_date | date('yyyy-MM-dd')) < (inputs.start_date | date('yyyy-MM-dd')) }}"
+    errorMessage: "Invalid input: end_date {{ inputs.end_date | date('yyyy-MM-dd') }} is before start_date {{ inputs.start_date | date('yyyy-MM-dd') }}."
+
+  - id: check_not_future
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ (inputs.end_date | date('yyyy-MM-dd')) > now(format='yyyy-MM-dd', timeZone=envs.fetcher_timezone) }}"
+    errorMessage: "Invalid input: end_date {{ inputs.end_date | date('yyyy-MM-dd') }} is in the future (today is {{ now(format='yyyy-MM-dd', timeZone=envs.fetcher_timezone) }} in {{ envs.fetcher_timezone }})."
+
+  - id: find_fetcher_image
+    type: io.kestra.plugin.docker.cli.ImageLs
+    runIf: "{{ inputs.mode != 'transform_only' }}"
+    imageNameFilter: "{{ vars.fetcher_image }}"
+
+  - id: check_fetcher_image
+    type: io.kestra.plugin.core.execution.Fail
+    runIf: "{{ inputs.mode != 'transform_only' }}"
+    condition: "{{ outputs.find_fetcher_image.count == 0 }}"
+    errorMessage: "Docker image {{ vars.fetcher_image }} not found. Build the job images first: docker compose --profile jobs build"
+
+  - id: find_transform_image
+    type: io.kestra.plugin.docker.cli.ImageLs
+    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    imageNameFilter: "{{ vars.transform_image }}"
+
+  - id: check_transform_image
+    type: io.kestra.plugin.core.execution.Fail
+    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    condition: "{{ outputs.find_transform_image.count == 0 }}"
+    errorMessage: "Docker image {{ vars.transform_image }} not found. Build the job images first: docker compose --profile jobs build"
+
+  - id: check_project_dir
+    type: io.kestra.plugin.docker.cli.Run
+    containerImage: "{{ vars.compose_image }}"
+    entryPoint: ["/bin/sh", "-c"]
+    commands:
+      - >-
+        test -f '{{ envs.host_project_dir }}/docker-compose.yml' && test -f '{{ envs.host_project_dir }}/.env'
+        || { echo "HOST_PROJECT_DIR={{ envs.host_project_dir }} is not the repo on the host (docker-compose.yml/.env not found). Set it in .env and run: docker compose up -d kestra"; exit 1; }
+    volumes:
+      - "{{ envs.host_project_dir }}:{{ envs.host_project_dir }}:ro"
+
+  # fetch
+  - id: fetch
+    type: io.kestra.plugin.docker.cli.Run
+    runIf: "{{ inputs.mode != 'transform_only' }}"
+    containerImage: "{{ vars.compose_image }}"
+    entryPoint: ["/bin/sh", "-c"]
+    commands:
+      - |
+        { docker compose \
+            --project-name {{ envs.compose_project_name }} \
+            --project-directory {{ envs.host_project_dir }} \
+            --file {{ envs.host_project_dir }}/docker-compose.yml \
+            --profile jobs \
+            run --rm --no-deps -T fetcher \
+            --start-date {{ inputs.start_date | date('yyyy-MM-dd') }} \
+            --end-date {{ inputs.end_date | date('yyyy-MM-dd') }}{% if inputs.force_overwrite %} --force-overwrite{% endif %} 2>&1
+          echo "__rc=$?"; } | awk '
+          /^__rc=/ { if (buf != "") print buf; sub(/^__rc=/, ""); rc = $0 + 0; buf = ""; fflush(); next }
+          /^ ?(Container|Network|Volume) .* (Creating|Created|Starting|Started|Running|Waiting|Healthy)$/ { next }
+          /^[ \t]/ && buf != "" { sub(/^[ \t]+/, ""); buf = buf "  |  " $0; next }
+          { if (buf != "") { print buf; fflush() } buf = $0 }
+          END { if (buf != "") print buf; printf "::{\"outputs\":{\"exitCode\":%d}}::\n", rc; exit rc }'
+        rc=$?
+        if [ "$rc" -eq 2 ]; then exit 0; fi
+        exit $rc
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "{{ envs.host_project_dir }}:{{ envs.host_project_dir }}:ro"
+    timeout: PT3H
+    retry:
+      type: constant
+      interval: PT30M
+      maxAttempts: 5
+
+  - id: fetch_exit_code
+    type: io.kestra.plugin.core.execution.Fail
+    runIf: "{{ inputs.mode != 'transform_only' }}"
+    condition: "{{ (outputs.fetch.vars.exitCode ?? -1) != 0 }}"
+    errorMessage: "{% if (outputs.fetch.vars.exitCode ?? -1) == 2 %}Fetcher exited with code 2: invalid arguments or configuration (S3 credentials, bucket, FETCHER_TIMEZONE, FETCHER_REFERENCE_DATE ...). Not retried.{% else %}Fetcher exit code unknown (no exit code line in the output).{% endif %} See the logs of the fetch task."
+
+  # transform
+  - id: transform
+    type: io.kestra.plugin.docker.cli.Run
+    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    containerImage: "{{ vars.compose_image }}"
+    entryPoint: ["/bin/sh", "-c"]
+    commands:
+      - |
+        { docker compose \
+            --project-name {{ envs.compose_project_name }} \
+            --project-directory {{ envs.host_project_dir }} \
+            --file {{ envs.host_project_dir }}/docker-compose.yml \
+            --profile jobs \
+            run --rm --no-deps -T transform \
+            --start-date {{ inputs.start_date | date('yyyy-MM-dd') }} \
+            --end-date {{ inputs.end_date | date('yyyy-MM-dd') }}{% if inputs.mode == 'transform_only' %} --retransform{% endif %}{% if (inputs.lines ?? '') is not empty %} --lines '{{ inputs.lines }}'{% endif %} 2>&1
+          echo "__rc=$?"; } | awk '
+          /^__rc=/ { if (buf != "") print buf; sub(/^__rc=/, ""); rc = $0 + 0; buf = ""; fflush(); next }
+          /^ ?(Container|Network|Volume) .* (Creating|Created|Starting|Started|Running|Waiting|Healthy)$/ { next }
+          /^[ \t]/ && buf != "" { sub(/^[ \t]+/, ""); buf = buf "  |  " $0; next }
+          { if (buf != "") { print buf; fflush() } buf = $0 }
+          END { if (buf != "") print buf; printf "::{\"outputs\":{\"exitCode\":%d}}::\n", rc; exit rc }'
+        exit $?
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "{{ envs.host_project_dir }}:{{ envs.host_project_dir }}:ro"
+    timeout: PT3H
+
+  # aggregate
+  - id: aggregate
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    url: "jdbc:postgresql://{{ envs.postgres_host }}:{{ envs.postgres_port }}/{{ envs.postgres_db }}"
+    username: "{{ envs.postgres_user }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: CALL reporting.refresh_od_delay();
+    fetchType: NONE
+    timeout: PT30M
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+
+  # Read-only summary for the UI
+  - id: summary
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    url: "jdbc:postgresql://{{ envs.postgres_host }}:{{ envs.postgres_port }}/{{ envs.postgres_db }}"
+    username: "{{ envs.postgres_user }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      SELECT
+        (SELECT count(*) FROM staging.stop_events
+          WHERE betriebstag BETWEEN DATE '{{ inputs.start_date | date('yyyy-MM-dd') }}' AND DATE '{{ inputs.end_date | date('yyyy-MM-dd') }}') AS staging_rows_in_range,
+        (SELECT count(DISTINCT (betriebstag, fahrt_bezeichner)) FROM staging.stop_events
+          WHERE betriebstag BETWEEN DATE '{{ inputs.start_date | date('yyyy-MM-dd') }}' AND DATE '{{ inputs.end_date | date('yyyy-MM-dd') }}') AS staging_trips_in_range,
+        (SELECT count(*) FROM reporting.od_delay_by_slot) AS reporting_rows
+    fetchType: FETCH_ONE
+
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    message: >-
+      Run OK ({{ inputs.mode }}, {{ inputs.start_date | date('yyyy-MM-dd') }}..{{ inputs.end_date | date('yyyy-MM-dd') }}):
+      staging rows in range={{ outputs.summary.row.staging_rows_in_range }},
+      trips in range={{ outputs.summary.row.staging_trips_in_range }},
+      reporting.od_delay_by_slot rows={{ outputs.summary.row.reporting_rows }}

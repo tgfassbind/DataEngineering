@@ -1,0 +1,48 @@
+# Server configuration
+
+datasources:
+  postgres:
+    url: jdbc:postgresql://kestra-db:5432/${DENG_KESTRA_DB_NAME}
+    driverClassName: org.postgresql.Driver
+    username: ${DENG_KESTRA_DB_USER}
+    password: ${DENG_KESTRA_DB_PASSWORD}
+
+kestra:
+  repository:
+    type: postgres
+  queue:
+    type: postgres
+  storage:
+    type: local
+    local:
+      base-path: /app/storage
+
+  server:
+    basic-auth:
+      username: ${DENG_KESTRA_BASIC_AUTH_USERNAME}
+      password: ${DENG_KESTRA_BASIC_AUTH_PASSWORD}
+
+  plugins:
+    # This list replaces Kestra's default list, so the three defaults are repeated.
+    configurations:
+      - type: io.kestra.plugin.core.flow.Subflow
+        values:
+          outputs:
+            enabled: true
+      - type: io.kestra.plugin.core.flow.Flow
+        values:
+          outputs:
+            enabled: true
+      - type: io.kestra.plugin.core.trigger.Schedule
+        values:
+          recoverMissedSchedules: ALL
+      - type: io.kestra.plugin.scripts.runner.docker.Docker
+        values:
+          volume-enabled: true
+
+  tutorial-flows:
+    enabled: false
+  anonymous-usage-report:
+    enabled: false
+  ui-anonymous-usage-report:
+    enabled: false

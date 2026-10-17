@@ -1,0 +1,50 @@
+# Thin scheduled flow: once per day, run the pipeline for "yesterday".
+# All pipeline logic lives in deng.backfill; this flow only computes the date.
+#
+# Schedule: edit `cron` below (Europe/Zurich local time) and restart the kestra
+# container (`docker compose up -d --force-recreate kestra`); the flow files are
+# reloaded at startup. Kestra does not allow expressions in `cron`.
+id: daily
+namespace: deng
+description: |
+  Daily run at 06:15 Europe/Zurich: `deng.backfill` with start = end = yesterday
+  (Europe/Zurich calendar day), mode `full`.
+
+  * Scheduled run: yesterday relative to the scheduled date (`trigger.date`),
+    also for schedule backfills and recovered missed schedules.
+  * Manual run (Execute button): yesterday relative to the execution start.
+
+labels:
+  project: travel-buddy
+
+tasks:
+  - id: yesterday
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      day: "{{ (trigger.date ?? execution.startDate) | date('yyyy-MM-dd', timeZone='Europe/Zurich') | dateAdd(-1, 'DAYS', format='yyyy-MM-dd', timeZone='Europe/Zurich') }}"
+
+  - id: log_day
+    type: io.kestra.plugin.core.log.Log
+    message: "Reference date {{ trigger.date ?? execution.startDate }} -> processing operating day {{ outputs.yesterday.values.day }}"
+
+  - id: run_pipeline
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: deng
+    flowId: backfill
+    wait: true
+    transmitFailed: true
+    inputs:
+      start_date: "{{ outputs.yesterday.values.day }}"
+      end_date: "{{ outputs.yesterday.values.day }}"
+      mode: full
+      force_overwrite: false
+    labels:
+      triggered_by: daily
+
+triggers:
+  - id: every_morning
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "15 6 * * *"
+    timezone: Europe/Zurich
+    # Run every missed day once it is up again.
+    recoverMissedSchedules: ALL
