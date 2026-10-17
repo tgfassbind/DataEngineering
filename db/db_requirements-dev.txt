@@ -1,0 +1,5 @@
+# Test-only dependencies for db/tests: the same pinned psycopg set as transform/requirements.txt
+# (installed with --no-deps + pip check). The tests need a real PostgreSQL 16, no mocks.
+psycopg[binary]==3.2.3
+psycopg-binary==3.2.3
+typing_extensions==4.12.2
