@@ -11,9 +11,14 @@ The group members are:
 dataengineering/
 ├── dataset/
 ├── docs/ # documents related to the project
-│
+
 ├── db/
-│   └── init/01_schemas.sql # schemas
+│   ├── init/ # run by the Postgres image on an empty db-data volume, in this order
+│   │  ├─ 01_schemas.sql # schemas + staging.stop_events
+│   │  ├─ 02_reporting_tables.sql # reporting.od_delay_by_slot
+│   │  └─ 03_refresh_procedure.sql # CALL reporting.refresh_od_delay()
+│   ├── tests/ # aggregation tests
+│   └── requirements-dev.txt
 │
 ├── fetcher/ # fetcher component of the data pipeline
 │   ├─ app/
@@ -27,6 +32,12 @@ dataengineering/
 │   ├─ Dockerfile
 │   ├─ requirements.txt # runtime dependencies
 │   └─ requirements-dev.txt # test-only dependencies
+│
+├── orchestrator/ # workflow orchestration (Kestra)
+│   ├─ flows/
+│   │  ├─ backfill.yml # deng.backfill: fetch -> transform -> aggregate for a date range
+│   │  └─ daily.yml # deng.daily: schedule, runs backfill for yesterday
+│   └─ kestra/application.yml # server configuration
 │
 ├── transform/ # transform component (raw CSV -> PostgreSQL staging)
 │   ├─ app/
@@ -471,9 +482,10 @@ baked into the image and the repo's copy is mounted over it, so edits apply
 without a rebuild.
 
 **Database credentials** only take effect when the `db-data` volume is
-created. Changing them later, or changing `db/init/01_schemas.sql`, needs
-`docker compose down -v`, which **deletes all database data** (object storage
-data is in its own volume and is also deleted by `-v`).
+created. Changing them later, or changing any `db/init/*.sql`, needs a fresh
+database volume: `docker compose down && docker volume rm deng-datapipeline_db-data`
+(deletes all database data, keeps the raw files). Do not use `docker compose down -v`:
+it also deletes the object storage volume with all raw files.
 
 ## Reproducibility
 
@@ -570,3 +582,484 @@ deliberately produce some `time_order` rejections.
   lines is filtered out like any other line and cannot be detected.
 * The fetcher README documents `;`-separated files; Ist-Daten v2 (and the
   fixture) is `,`-separated. Both are accepted.
+
+# Aggregation: staging → reporting
+
+The last pipeline step. A stored procedure in the existing PostgreSQL
+(no extra container) recomputes the data product `reporting.od_delay_by_slot`
+from `staging.stop_events`.
+
+```
+staging.stop_events ──CALL reporting.refresh_od_delay()──► reporting.od_delay_by_slot
+ (one row per trip × stop, seconds)                         (median per line × stop pair × weekday × hour, minutes)
+```
+
+## Purpose
+
+Answers "how late is line X from stop A to stop B, on this weekday, in this
+hour?" for any origin-destination pair of a line, not only neighbouring stops.
+So Zürich HB → Luzern and Zürich HB → Rotkreuz are separate rows. The reverse
+direction comes from trips running the other way.
+
+## Table `reporting.od_delay_by_slot`
+
+Created by `db/init/02_reporting_tables.sql` (comments in the database: `\d+ reporting.od_delay_by_slot`).
+
+| Column | Type | Meaning |
+|---|---|---|
+| `linien_text`, `betreiber_abk` | text | line and operator |
+| `from_bpuic`, `from_stop` | integer, text | origin stop (boarding) |
+| `to_bpuic`, `to_stop` | integer, text | destination stop (any later stop of the same trip) |
+| `weekday` | smallint | ISO weekday of the planned departure at the origin, 1 = Mon … 7 = Sun |
+| `slot_hour` | smallint | hour 0..23 of the planned departure at the origin |
+| `median_dep_delay_min` | numeric(6,1), NULL | median departure delay at the origin, minutes |
+| `median_arr_delay_min` | numeric(6,1), NULL | median arrival delay at the destination, minutes |
+| `n_dep_obs`, `n_arr_obs` | integer | number of non-NULL observations behind each median |
+
+Primary key `(linien_text, betreiber_abk, from_bpuic, to_bpuic, weekday, slot_hour)`.
+Lookup index on `(linien_text, betreiber_abk, from_stop, to_stop, weekday, slot_hour)`.
+CHECKs: weekday 1..7, hour 0..23, counts ≥ 0, at least one count > 0, and each
+median is NULL **exactly** when its count is 0.
+
+## Rules
+
+* **Pairs.** For every trip (`betriebstag`, `fahrt_bezeichner`) every ordered
+  stop pair (a, b) with `b.stop_sequence > a.stop_sequence`. Origins without a
+  planned departure (`sched_dep IS NULL`) give no pairs.
+* **Slot.** `weekday` = ISO weekday and `slot_hour` = hour of `a.sched_dep`. The
+  slot belongs to the departure at the origin, not to the operating day:
+  a trip of Monday's operating day that leaves at 00:06 on Tuesday is in
+  weekday 2, slot 0.
+* **Median.** `percentile_cont(0.5)` over the signed seconds (mean of the two
+  middle values for an even count), divided by 60 and rounded **once** to 0.1,
+  half away from zero (`numeric` `round`): 3 s = 0.05 → 0.1, −3 s → −0.1,
+  −2.5 s = −0.04 → 0.0 (never −0.0). NULL delays are ignored; a 0 is a real
+  "on time".
+* **Counts.** One observation per trip and operating day. The departure delay
+  at A counts once for every destination B of that trip. No minimum: a median
+  can rest on a single observation, so check `n_*_obs` before trusting a value.
+* Groups where both counts are 0 are left out.
+* **Stop names**: `min()` over the group in byte order (`COLLATE "C"`), so the
+  result does not depend on the server's locale.
+* All lines in staging are aggregated. The line selection happens in the transform.
+
+## Procedure `reporting.refresh_od_delay()`
+
+Created by `db/init/03_refresh_procedure.sql`.
+
+* **Full recompute, atomic.** `DELETE` + `INSERT … SELECT` in the CALL's own
+  transaction, no `COMMIT` inside, no `TRUNCATE`. Readers are never blocked and
+  see the old content until the commit. On any error everything is rolled back
+  and the old content stays.
+* **Idempotent.** Same staging gives the same table, however often it is called.
+* **One at a time.** A transaction-level advisory lock (key 8502202) serialises
+  calls. A second call waits up to `lock_wait` (default 30 s), then fails with
+  SQLSTATE `55P03`, "another refresh is still running", and changes nothing.
+  Other waits: `CALL reporting.refresh_od_delay(interval '5 minutes')`, at
+  most 24 days. **`interval '0'` means wait without a limit**, as with
+  PostgreSQL's `lock_timeout`. The same limit applies to the table locks of the
+  DELETE/INSERT, so a conflicting `ALTER TABLE` also makes the call fail rather
+  than hang. Session settings of the caller (`lock_timeout`, `search_path`)
+  are left unchanged, even inside an explicit transaction.
+* **Summary**, as a NOTICE:
+  `reporting.refresh_od_delay: rows_deleted=0 rows_written=1914 distinct_pairs=132 duration=0.025s (lock_waited=0.000s)`
+
+### How to call
+
+Once, after the last transformed day of a run (not after every day: it always
+recomputes everything):
+
+```bash
+docker compose run --rm transform --start-date 2026-09-01 --end-date 2026-09-30
+docker compose exec database sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CALL reporting.refresh_od_delay();"'
+```
+
+`psql` exits with code 1 if the CALL fails (e.g. the lock wait ran out). Example query:
+
+```sql
+SELECT weekday, slot_hour, median_dep_delay_min, median_arr_delay_min, n_dep_obs, n_arr_obs
+FROM reporting.od_delay_by_slot
+WHERE linien_text = 'S1' AND betreiber_abk = 'SBB' AND from_stop = 'Rotkreuz' AND to_stop = 'Luzern'
+ORDER BY weekday, slot_hour;
+```
+
+### Fixture acceptance
+
+With the fixture loaded **without the via filter** (`--lines IR75:SBB,S1:SBB`:
+445 staging rows / 51 trips), the result is 1914 rows and 132 distinct stop pairs.
+`db/tests/acceptance_fixture.sql` checks this and the spot values, and only reads:
+
+```bash
+docker compose run --rm --entrypoint python transform \
+    -m app.seed --file dataset/excerpt_21092026_istdaten_v2.csv --date 2026-09-21
+docker compose run --rm transform --date 2026-09-21 --lines IR75:SBB,S1:SBB
+docker compose exec database sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CALL reporting.refresh_od_delay();"'
+docker compose exec -T database sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+    < db/tests/acceptance_fixture.sql
+# NOTICE:  acceptance OK
+```
+
+With the default `transform/config/lines.yml` (IR75 *and* S1 only via
+Rotkreuz 8502202), 12 IR75 trips are excluded. Staging then holds 361 rows /
+39 trips, and the result is 1662 rows (132 pairs). The acceptance script
+expects the first variant.
+
+**Compare two teams' results** (same idea as the staging fingerprint):
+
+```sql
+SELECT count(*), md5(string_agg(t::text, '|' ORDER BY linien_text COLLATE "C", betreiber_abk COLLATE "C",
+                                from_bpuic, to_bpuic, weekday, slot_hour))
+FROM reporting.od_delay_by_slot t;
+-- fixture without via filter: 1914 | b9bcbff0e27e4423869448b6f99600fe
+```
+
+### Rebuild after a schema change
+
+Tables and the procedure are created **only** by `db/init/*.sql`, which the
+Postgres image runs only when the `db-data` volume is empty. After a change to
+any of these files, remove **only the database volume**:
+
+```bash
+docker compose down
+docker volume rm deng-datapipeline_db-data
+docker compose up -d database          # init scripts run again
+docker compose run --rm transform --start-date … --end-date … # staging is empty again: re-transform
+docker compose exec database sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CALL reporting.refresh_od_delay();"'
+```
+
+This keeps `storage-data`, so the transform rebuilds staging from the raw files
+already in object storage. Never use `docker compose down -v`: it also deletes
+`storage-data`, i.e. all raw files.
+
+## Tests
+
+Against a **real PostgreSQL 16** (no mocks). Each test class creates its own
+temporary database from all `db/init/*.sql` in sorted order and drops it afterwards.
+
+```bash
+cd db
+python -m venv .venv && . .venv/bin/activate      # Python 3.12
+pip install --no-deps -r requirements-dev.txt && pip check
+docker compose up -d database
+E2E_POSTGRES_HOST=127.0.0.1 E2E_POSTGRES_PORT=5432 E2E_POSTGRES_USER=<from .env> \
+E2E_POSTGRES_PASSWORD=<from .env> E2E_POSTGRES_DB=deng python -m unittest discover -s tests -t . -v
+```
+
+| File | What it proves |
+|---|---|
+| `test_refresh_scenarios.py` | hand-worked medians: odd/even counts, NULLs, negatives, ±0.05 / ±0.15 rounding, −0.04 → 0.0, single-stop trips, origins without `sched_dep`, two lines/operators on one pair, all pairs of a trip, slots 23 and 0 across midnight and the Sunday → Monday change, byte-order stop names |
+| `test_refresh_differential.py` | three fixed seeds of random staging data vs. a pure-Python reference (`reference.py`, `Decimal` + `ROUND_HALF_UP`); exact equality including the text of every median (`E2E_DIFF_SEEDS` for other seeds) |
+| `test_refresh_behaviour.py` | idempotency, a failure halfway (numeric overflow after the DELETE) keeps the old table, no COMMIT inside, readers not blocked, lock wait and timeout, caller settings untouched, CHECKs, comments, index, init scripts re-runnable, same result in an ICU `en-US` database |
+| `test_refresh_performance.py` | about 1 million pair observations (60 days × 160 trips × 15 stops); prints the duration (`E2E_SKIP_PERF=1` skips it) |
+
+Measured: 1,008,000 pair observations → 24,892 rows in 5.5–8 s per call
+(several runs, PostgreSQL 16 with default settings). For comparison,
+one fixture day gives 1,914 pairs, so a year of IR75 + S1 is about 0.7 million.
+
+## Known limitations
+
+* **Daylight saving time** (single caveat). The slot is the hour of the naive
+  local `sched_dep`. On the autumn changeover (25.10.2026) the two 02:00 hours
+  fall into one slot. Delays across a changeover can be off by ±1 h (see
+  transform limitations). Not corrected.
+* **No minimum on `n_*_obs`.** A median from one observation is stored like one
+  from a hundred. Consumers decide on a threshold.
+* **Full recompute.** Every call rebuilds the whole table from all of staging.
+  Cost grows with history × (stops per trip)², about 5–8 s per million pairs
+  here. Call it once per run, not per day. Incremental refresh is not implemented.
+* **Weekday and slot come from the planned departure** at the origin, not from
+  the operating day or the actual time. A late-evening train that leaves after
+  midnight belongs to the next weekday.
+* Stop names are informational (`min()` per group). The identity is `bpuic`;
+  if SBB renames a stop, the alphabetically smaller spelling is shown.
+* Medians are limited to ±99,999.9 min by `numeric(6,1)`. A larger value (only
+  possible if the transform's 3 h limit is raised a lot) fails the CALL, and
+  the old content stays.
+
+# Orchestration (Kestra)
+
+The whole pipeline (fetch → transform → aggregate) runs as a Kestra workflow:
+once a day on a schedule, and on demand for reruns and backfills.
+
+```
+             Kestra (UI 127.0.0.1:8080)                       Docker network <project>_deng-datapipeline
+ daily ──subflow──► backfill ──Docker socket──► fetcher container ──► object-storage (raw/…csv)
+ (06:15 Zurich)     │                       └─► transform container ─► database (staging)
+                    └──JDBC: CALL reporting.refresh_od_delay()──────► database (reporting)
+ kestra-db: Kestra's own metadata (flows, executions), never pipeline data
+```
+
+| Piece | What it is |
+|---|---|
+| `kestra` | `kestra/kestra:v2.0.4`, standalone server (all components in one JVM). UI/API on `127.0.0.1:${KESTRA_UI_PORT}` with basic auth; management port 8081 not published |
+| `kestra-db` | `postgres:16.10-bookworm`, Kestra metadata only, volume `kestra-db-data`, no published port, own network `kestra-internal` |
+| `orchestrator/flows/backfill.yml` | flow `deng.backfill`: the engine (inputs: date range, mode, force overwrite) |
+| `orchestrator/flows/daily.yml` | flow `deng.daily`: schedule, computes yesterday, calls `backfill` as a subflow |
+| `orchestrator/kestra/application.yml` | Kestra server configuration, no secrets (placeholders filled from `.env`) |
+
+The flows are versioned here and loaded automatically at every start of the
+`kestra` container (`--flow-path`). **The repo is the source of truth**: changes
+made in the UI editor are overwritten at the next start. Deleting a file does
+not delete the flow in Kestra (delete it in the UI). An invalid flow file is only
+logged (`docker compose logs kestra | grep -i "unable to create flow"`), Kestra
+still starts.
+
+## Setup and start
+
+```bash
+cp .env.example .env                # set the KESTRA_* values (see below)
+                                    # existing .env: append the "Orchestrator (Kestra)" block of .env.example
+docker compose --profile jobs build # REQUIRED once: builds deng-datapipeline/fetcher:1.0.0 and transform:1.0.0
+docker compose up -d                # object-storage, database, kestra-db, kestra
+docker compose ps                   # wait until kestra is "healthy" (1–2 min on the first start)
+```
+
+Open **http://localhost:8080** and log in with `KESTRA_BASIC_AUTH_USERNAME` /
+`KESTRA_BASIC_AUTH_PASSWORD`. Kestra requires an e-mail address as user name and
+a password with at least 8 characters, one upper case letter, one lower case
+letter and one digit (the default `ChangeMe123` qualifies). With invalid values
+Kestra still starts, but the UI shows a "create user" page instead of the login.
+
+The job images are never pulled (they only exist locally). Each run checks for
+them first and fails with *"Docker image … not found. Build the job images
+first: docker compose --profile jobs build"*. Rebuild after changing fetcher or
+transform code.
+
+Under **Flows → namespace `deng`** you find `backfill` and `daily`.
+
+| `.env` variable | Default | Purpose |
+|---|---|---|
+| `KESTRA_BASIC_AUTH_USERNAME`, `KESTRA_BASIC_AUTH_PASSWORD` | `admin@example.com`, `ChangeMe123` | UI/API login (applied at every start) |
+| `KESTRA_UI_PORT` | 8080 | UI port on 127.0.0.1 |
+| `KESTRA_DB_USER`, `KESTRA_DB_PASSWORD`, `KESTRA_DB_NAME` | `kestra`, `change-me`, `kestra` | `kestra-db`; only applied when `kestra-db-data` is created |
+| `DOCKER_SOCKET` | `/var/run/docker.sock` | host path of the Docker socket (rootless Docker: `/run/user/<uid>/docker.sock`) |
+| `PIPELINE_NETWORK` | empty = `<project>_deng-datapipeline` | network the job containers join (`deng-datapipeline_deng-datapipeline` for this repo) |
+
+All other settings of the job containers (`S3_*`, `POSTGRES_*`, `PERMALINK_URL_TEMPLATE`,
+`ARCHIVE_URL_TEMPLATE`, `FETCHER_*`, `TRANSFORM_*`) come from the same `.env`
+variables as for `docker compose run fetcher/transform`, with the same defaults.
+
+### How the job containers are started
+
+Kestra starts the existing images as one-shot **sibling** containers through the
+mounted Docker socket (task type `io.kestra.plugin.docker.cli.Run`):
+
+* **Network:** `PIPELINE_NETWORK`, i.e. the Compose network of this project, so
+  the jobs reach `object-storage` and `database` by name. With
+  `docker compose -p other …` the default follows the project name
+  (`other_deng-datapipeline`), through the `COMPOSE_PROJECT_NAME` interpolation of
+  the Compose specification. If your Compose version does not support it, set
+  `PIPELINE_NETWORK` explicitly.
+* **Host paths:** the daemon resolves bind mounts on the *host*, not inside the
+  Kestra container. The setup therefore needs none for the jobs:
+  `transform/config/lines.yml` is mounted into the Kestra container
+  (`/app/deng/transform-config`, read-only) and copied by Kestra into each
+  transform container's working directory (`inputFiles`; `TRANSFORM_LINES_FILE=lines.yml`).
+  Edits to the file apply to the next run, without restart or rebuild.
+  `TRANSFORM_LINES_FILE` from `.env` is not used by the flows: they always use
+  the repo's `transform/config/lines.yml`, or the `lines` input per run. The
+  fetcher's archive scratch space is the named volume `<project>_fetcher-scratch`
+  (emptied by the fetcher after each run; without it every run would leave an
+  anonymous volume behind). The only host path is the Docker socket (`DOCKER_SOCKET`).
+* **Working directory:** Kestra runs the container in its own working directory,
+  so the flows set `PYTHONPATH=/opt/fetcher` / `/opt/transform`; the images are unchanged.
+* **Secrets:** `S3_SECRET_ACCESS_KEY` and `POSTGRES_PASSWORD` reach the jobs as
+  Kestra secrets: the `kestra` entrypoint turns the plain `.env` values into
+  Kestra's `SECRET_<NAME>` (base64) variables, the flows use `{{ secret('…') }}`
+  (masked in logs). Non-secret settings are `ENV_<NAME>` variables, read as
+  `{{ envs.<name> }}`. Nothing secret is in the flow files or in git.
+* **Memory:** the transform container gets `TRANSFORM_MEM_LIMIT` (default 1g) as in Compose.
+
+## The flows
+
+### `backfill` (the engine)
+
+| Input | Values | Meaning |
+|---|---|---|
+| `start_date`, `end_date` | YYYY-MM-DD | inclusive range; `end_date >= start_date`, not after today (Europe/Zurich) |
+| `mode` | `full` (default), `fetch_only`, `transform_only` | see below |
+| `force_overwrite` | false (default) | fetcher `--force-overwrite` (re-download stored days) |
+| `lines` | empty (default) | transform `--lines` override, e.g. `IR75:SBB,S1:SBB`; empty = `transform/config/lines.yml` |
+
+| Mode | Steps (one container each, for the whole range) | Changes |
+|---|---|---|
+| `full` | fetch `--start-date A --end-date B [--force-overwrite]` → transform `--start-date A --end-date B` → `CALL reporting.refresh_od_delay()` | missing raw files fetched; staging upserted; reporting recomputed |
+| `fetch_only` | fetch only | raw files only |
+| `transform_only` | transform `--retransform` → aggregation | staging of the range rebuilt from the raw files; reporting recomputed; raw files untouched |
+
+`full` upserts without `--retransform`. After a `full` run with
+`force_overwrite` (corrected source file), run `transform_only` for the same
+range to also remove rows that disappeared from the file (`stale=N` in the
+transform log; see the transform's known limitations).
+
+Task order: `label_run` → `check_range`, `check_not_future` (input validation) →
+image checks → `fetch` → `fetch_exit_code` → `transform` → `aggregate` →
+`summary` (row counts as task output and log line).
+
+**Failure rule:** a step fails if *any* day of the range failed in it (exit
+code ≠ 0), the run is then FAILED and later steps do not run. The aggregation
+therefore runs only when the transform succeeded for **every** day of the range,
+exactly once per run. Days that the transform already committed before another
+day failed stay in staging (each day is its own transaction); reporting keeps its
+previous content until a successful run.
+
+| Exit code | fetcher | transform |
+|---|---|---|
+| 0 | task OK | task OK |
+| 1 (≥ 1 day FAILED) | task FAILED → **retried**: 5 attempts, 30 min apart (a day may not be published yet; already stored days are SKIPPED on retry, but with `force_overwrite` every retry downloads the whole range again) | task FAILED, no retry |
+| 2 (arguments/configuration) | task `fetch_exit_code` fails the run, **no retry** | task FAILED, no retry |
+
+Input validation errors are never retried either. The aggregation retries a
+failed `CALL` twice, 1 min apart (e.g. SQLSTATE 55P03 when someone runs the
+procedure by hand at the same time); it is a full recompute in one transaction,
+so a retry cannot double anything. Retry settings are in the `retry:` blocks in
+`backfill.yml` (Kestra does not allow expressions there); restart `kestra` after editing.
+
+Runs are serialised (`concurrency: limit 1, QUEUE`): a manual backfill started
+while the daily run is busy waits for it.
+
+### `daily` (schedule)
+
+* Trigger `every_morning`: cron `15 6 * * *` in **Europe/Zurich** (daylight
+  saving time handled by Kestra). To change the time, edit `cron` in
+  `orchestrator/flows/daily.yml` and run `docker compose up -d --force-recreate kestra`.
+* Computes yesterday as the Europe/Zurich calendar day before the scheduled
+  date (manual run: before the start time) and calls `backfill` with
+  start = end = yesterday, mode `full`. Conversion to the Zurich date happens
+  before subtracting the day, so runs shortly after midnight and on DST change days are correct.
+* Missed schedules (computer off) are run afterwards, one per missed day
+  (`recoverMissedSchedules: ALL`).
+* The SBB data of a day is published the next morning; if it is not there yet
+  at 06:15, the fetch retries for two hours.
+
+## Running the flows
+
+**UI:** *Flows → deng → backfill → Execute*, fill in the inputs, *Execute*.
+The execution page shows the Gantt/Topology view, each task's logs (the
+fetcher/transform summary lines) and *Outputs* (`summary.row`, `fetch.vars.exitCode`).
+
+**API** (same credentials; useful for scripts):
+
+```bash
+KESTRA="-u admin@example.com:ChangeMe123 http://localhost:8080/api/v1/main/executions/deng"
+
+# full: fetch + transform + aggregate for a range
+curl -s $KESTRA/backfill -F start_date=2026-10-01 -F end_date=2026-10-07 -F mode=full
+
+# fetch_only: just get the raw files (e.g. a corrected file: add -F force_overwrite=true)
+curl -s $KESTRA/backfill -F start_date=2026-09-01 -F end_date=2026-09-30 -F mode=fetch_only
+
+# transform_only: rebuild staging (--retransform) + reporting from stored raw files
+curl -s $KESTRA/backfill -F start_date=2026-09-01 -F end_date=2026-09-30 -F mode=transform_only
+
+# daily, manually (processes yesterday)
+curl -s -X POST $KESTRA/daily
+```
+
+`curl` prints the execution (its `id`, state `CREATED`); add `?wait=true` to the
+URL to wait for the end. Without `-u` the API answers 401.
+
+### Backfill: two ways
+
+**(a) Explicit range with `backfill`** (examples above): one execution, one
+fetcher and one transform container for the whole range, one aggregation at the
+end, with the mode and `force_overwrite` you choose. Use this for history and reruns.
+
+**(b) Schedule backfill on the `daily` trigger:** *Flows → deng → daily →
+Triggers → every_morning → Backfill executions*, choose a start and end date.
+Kestra creates one `daily` execution for every 06:15 tick in that period, as if
+the schedule had run (trigger date = tick), so each processes the day *before*
+its tick (ticks 02.10.–08.10. → days 01.10.–07.10.). Each is a separate `full`
+run for a single day with its own aggregation; they queue one after another.
+Use it to fill gaps in the daily history exactly as the schedule would have.
+
+## Verification
+
+1. **Started:** `docker compose ps` → `kestra` and `kestra-db` *healthy*;
+   http://localhost:8080 asks for the login; `curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/api/v1/main/flows/search` → `401`.
+2. **Flows loaded:** UI *Flows* lists `deng.backfill` and `deng.daily`. If one
+   is missing, `docker compose logs kestra | grep -i "unable to create flow"`.
+   Flows can be validated with Kestra's own validator:
+   `curl -s -u admin@example.com:ChangeMe123 -H 'Content-Type: application/x-yaml' --data-binary @orchestrator/flows/backfill.yml http://localhost:8080/api/v1/main/flows/validate`
+   (an empty `constraints` means valid).
+3. **Fixture run** (no internet needed):
+
+```bash
+   docker compose run --rm --entrypoint python transform \
+       -m app.seed --file dataset/excerpt_21092026_istdaten_v2.csv --date 2026-09-21
+   curl -s "$KESTRA/backfill?wait=true" -F start_date=2026-09-21 -F end_date=2026-09-21 \
+       -F mode=transform_only -F lines=IR75:SBB,S1:SBB
+```
+
+   UI: execution SUCCESS; `fetch` tasks *skipped*; `transform` log
+   `date=2026-09-21 status=OK … rows_staged=445`; `log_summary`:
+   `staging rows in range=445, trips in range=51, reporting.od_delay_by_slot rows=1914`.
+   (Without `lines` the default `lines.yml` with the Rotkreuz via filter gives 361 / 39 / 1662.)
+
+   SQL (`docker compose exec database psql -U deng -d deng`):
+
+```sql
+   SELECT count(*), count(DISTINCT fahrt_bezeichner) FROM staging.stop_events WHERE betriebstag = '2026-09-21';
+   -- 445 | 51
+   SELECT count(*), md5(string_agg(t::text, '|' ORDER BY linien_text COLLATE "C", betreiber_abk COLLATE "C",
+                                   from_bpuic, to_bpuic, weekday, slot_hour))
+   FROM reporting.od_delay_by_slot t;
+   -- 1914 | b9bcbff0e27e4423869448b6f99600fe
+   SELECT betriebstag, count(*), md5(string_agg(row_hash, '' ORDER BY fahrt_bezeichner, bpuic))
+   FROM staging.stop_events GROUP BY 1 ORDER BY 1;   -- staging fingerprint
+```
+
+4. **Idempotent:** run the same execution again (*Replay* or the same `curl`):
+   both fingerprints are unchanged. (`--retransform` deletes and reinserts the
+   day, so `loaded_at` changes; the fingerprints exclude it.)
+5. **Failure:** `-F end_date=2026-09-23` (no raw files for 22./23.) → execution
+   FAILED at `transform` (`status=FAILED … not found - fetch the day first`),
+   `aggregate` not run, reporting unchanged.
+6. **Fetch against a test server** instead of SBB: set e.g.
+   `PERMALINK_URL_TEMPLATE=http://sbb-mock:8000/{day}_istdaten.csv` (a container
+   in the project network) and, for deterministic routing,
+   `FETCHER_REFERENCE_DATE=2026-09-25` in `.env`, then
+   `docker compose up -d kestra` (settings are read at container start).
+   `FETCHER_REFERENCE_DATE` must not be before `end_date` (the fetcher rejects
+   later days with exit 2); leave it empty in normal operation.
+7. **daily:** *Triggers* tab shows the next date in Europe/Zurich; *Execute*
+   once → `log_day` shows the computed day, the subflow `backfill` appears with
+   label `triggered_by: daily`.
+
+## Rerun after a failure
+
+* Fix the cause (source not yet published, image missing, credentials …), then
+  open the failed execution → **Restart**: Kestra reruns the failed task and
+  everything after it, with the same inputs. Or start a new `backfill` with the
+  same inputs: every step is idempotent (stored days are SKIPPED, staging is
+  upserted, `transform_only` rebuilds, the aggregation recomputes everything).
+* After a failed `daily` run, either restart it or run `backfill` for that day.
+
+## Reset only the orchestrator state
+
+Removes flows' execution history, triggers' last dates and Kestra logs; raw
+files, staging and reporting stay untouched:
+
+```bash
+docker compose rm -sf kestra kestra-db
+docker volume rm deng-datapipeline_kestra-db-data deng-datapipeline_kestra-data
+docker compose up -d                 # flows are loaded again from orchestrator/flows/
+```
+
+`docker compose down` while a job container is running fails with "active
+endpoints" on the network: wait for the run to finish (or kill it in the UI).
+
+Never use `docker compose down -v`: it also deletes `storage-data` (all raw
+files) and `db-data`. `docker volume rm deng-datapipeline_fetcher-scratch`
+removes the (normally empty) fetcher scratch volume.
+
+## Security note: Docker socket
+
+The `kestra` container runs as root with `/var/run/docker.sock` mounted. That is
+full control over the host's Docker daemon (equivalent to root on the host):
+anyone who can edit and run a flow can start any container with any mount. It is
+acceptable for this local course project because the UI is bound to 127.0.0.1,
+protected by basic auth and the management port is not published. It is **not**
+acceptable for production; there one would use a remote/rootless Docker
+endpoint, a Kubernetes task runner or a separate worker with restricted rights,
+real secret management and TLS.
