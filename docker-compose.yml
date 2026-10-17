@@ -106,6 +106,82 @@ services:
       start_period: 30s
     networks: [deng-datapipeline]
 
+  # Kestra metadata only
+  kestra-db:
+    image: postgres:16.10-bookworm
+    environment:
+      POSTGRES_USER: ${KESTRA_DB_USER:-kestra}
+      POSTGRES_PASSWORD: ${KESTRA_DB_PASSWORD:?append the Kestra block of .env.example to .env}
+      POSTGRES_DB: ${KESTRA_DB_NAME:-kestra}
+    volumes:
+      - kestra-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+    networks: [kestra-internal]
+
+  kestra:
+    image: kestra/kestra:v2.0.4
+    user: "root"
+    depends_on:
+      kestra-db:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+      object-storage:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        export SECRET_POSTGRES_PASSWORD="$$(printf '%s' "$$DENG_POSTGRES_PASSWORD" | base64 | tr -d '\n')"
+        unset DENG_POSTGRES_PASSWORD
+        exec /usr/local/bin/docker-entrypoint.sh "$$@"
+      - kestra-entrypoint
+    command:
+      - server
+      - standalone
+      - --config
+      - /etc/kestra/application.yml
+      - --flow-path
+      - /app/deng/flows
+    environment:
+      # server configuration (placeholders in orchestrator/kestra/application.yml)
+      DENG_KESTRA_DB_NAME: ${KESTRA_DB_NAME:-kestra}
+      DENG_KESTRA_DB_USER: ${KESTRA_DB_USER:-kestra}
+      DENG_KESTRA_DB_PASSWORD: ${KESTRA_DB_PASSWORD:?append the Kestra block of .env.example to .env}
+      DENG_KESTRA_BASIC_AUTH_USERNAME: ${KESTRA_BASIC_AUTH_USERNAME:?append the Kestra block of .env.example to .env}
+      DENG_KESTRA_BASIC_AUTH_PASSWORD: ${KESTRA_BASIC_AUTH_PASSWORD:?append the Kestra block of .env.example to .env}
+      KESTRA_URL: http://localhost:${KESTRA_UI_PORT:-8080}/
+      ENV_COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-deng-datapipeline}
+      ENV_HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:?set HOST_PROJECT_DIR in .env (absolute path of this repo on the host)}
+      ENV_FETCHER_TIMEZONE: ${FETCHER_TIMEZONE:-Europe/Zurich}
+      # aggregation
+      DENG_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      ENV_POSTGRES_HOST: ${POSTGRES_HOST:-database}
+      ENV_POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      ENV_POSTGRES_DB: ${POSTGRES_DB:-deng}
+      ENV_POSTGRES_USER: ${POSTGRES_USER:?copy .env.example to .env}
+    volumes:
+      - kestra-data:/app/storage
+      - ./orchestrator/kestra/application.yml:/etc/kestra/application.yml:ro
+      - ./orchestrator/flows:/app/deng/flows:ro
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:${KESTRA_UI_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    stop_grace_period: 6m
+    networks: [deng-datapipeline, kestra-internal]
+
   pgadmin:
     # optional web UI to look at the data: docker compose --profile tools up -d pgadmin
     image: dpage/pgadmin4:9.18.0
@@ -127,15 +203,18 @@ services:
         printf '{"Servers":{"1":{"Name":"SBB Ist-Daten","Group":"DENG","Host":"database","Port":5432,"MaintenanceDB":"%s","Username":"%s","SSLMode":"prefer"}}}' "$$POSTGRES_DB" "$$POSTGRES_USER" > /tmp/servers.json
         exec /entrypoint.sh
     ports:
-      - "127.0.0.1:${PGADMIN_PORT:-5050}:80"   # http://localhost:5050, this machine only
+      - "127.0.0.1:${PGADMIN_PORT:-5050}:80"
     volumes:
       - pgadmin-data:/var/lib/pgadmin   # pgAdmin settings, saved passwords, query history
     networks: [deng-datapipeline]
 
 networks:
   deng-datapipeline:
+  kestra-internal:
 
 volumes:
   storage-data:
   db-data:
   pgadmin-data:
+  kestra-db-data:
+  kestra-data:
