@@ -65,6 +65,7 @@ it touches one of them, and then the whole trip is kept.
 lines:
   - linien_text: IR75
     betreiber_abk: SBB
+    via_bpuic: [8502202]
   - linien_text: S1
     betreiber_abk: SBB
     via_bpuic: [8502202]     # Rotkreuz: S1 Luzern/Zug only
