@@ -15,7 +15,10 @@ VALUE_COLUMNS = [
     "arr_delay_s", "dep_delay_s", "is_additional_trip",
 ]
 STAGING_COLUMNS = VALUE_COLUMNS + ["row_hash"]
-
+# Line attributes for the dimension dim_line in BigQuery. Carried in the output
+# frame only: not stored in PostgreSQL staging and not part of row_hash, so
+# existing staging rows keep their hash.
+LINE_ATTRIBUTE_COLUMNS = ["betreiber_name", "verkehrsmittel_text", "produkt_id"]
 
 def delay_seconds(actual: pd.Series, planned: pd.Series, valid: pd.Series) -> pd.Series:
     """actual - planned in whole seconds; <NA> where the timestamp is not valid."""
@@ -33,6 +36,9 @@ def build_rows(validated: pd.DataFrame, day: date) -> pd.DataFrame:
         "haltestellen_name": v["HALTESTELLEN_NAME"].str.strip(),
         "linien_text": v["LINIEN_TEXT"].str.strip(),
         "betreiber_abk": v["BETREIBER_ABK"].str.strip(),
+        "betreiber_name": v["BETREIBER_NAME"].str.strip(),
+        "verkehrsmittel_text": v["VERKEHRSMITTEL_TEXT"].str.strip(),
+        "produkt_id": v["PRODUKT_ID"].str.strip(),
         "stop_sequence": v["stop_sequence"].astype("int64"),
         "sched_arr": v["sched_arr"],
         "sched_dep": v["sched_dep"],
