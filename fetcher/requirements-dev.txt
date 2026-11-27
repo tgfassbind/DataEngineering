@@ -1,3 +1,4 @@
 # Test-only dependencies
 -r requirements.txt
-moto[server]==5.0.28
+# Local Cloud Storage emulator for the end-to-end tests
+gcp-storage-emulator==2026.7.19

@@ -1,11 +1,11 @@
 """End-to-end test of the real CLI (subprocess) without Docker or internet.
 
-* Object storage: moto's S3 server (S3 API emulator) by default, or ANY real
-  S3 endpoint (e.g. the SeaweedFS service) when E2E_S3_ENDPOINT is set:
-      E2E_S3_ENDPOINT=http://127.0.0.1:8333 E2E_S3_ACCESS_KEY_ID=... \
-      E2E_S3_SECRET_ACCESS_KEY=... python -m unittest tests.test_e2e -v
+* Data lake: a local Cloud Storage emulator (gcp-storage-emulator, in memory).
+  The fetcher uses the real Google client; STORAGE_EMULATOR_HOST points it at
+  the emulator, so no Google account, key or network is needed. The tests
+  never touch the real bucket (they delete objects).
 * Sources: a local HTTP server mimicking the permalink CSVs and monthly ZIPs
-  (ZIP members at the root, named YYYY-MM-DD_istdaten.csv, like the real one).
+  (ZIP members at the root, named YYYY-MM-DD_IstDaten.csv, like the real one).
 
 Requires dev dependencies:  pip install -r requirements-dev.txt
 Run:                        python -m unittest tests.test_e2e -v
@@ -24,12 +24,12 @@ from collections import Counter
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import boto3
-from botocore.config import Config as BotoConfig
+from google.cloud import storage
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEADER = "BETRIEBSTAG;FAHRT_BEZEICHNER;BETREIBER_ID;LINIEN_TEXT\n"
 BUCKET = "travel-buddy-test"
+PROJECT = "test-project"
 
 
 def csv_for(day, version):
@@ -42,6 +42,7 @@ class Source:
     html_days = set()          # serve an HTML page (200) instead of CSV
     missing_in_zip = set()     # days left out of the monthly ZIP
     zip_prefix = ""            # e.g. "sub/" to simulate an upstream format change
+    truncate_days = set()      # send 20 MB of a promised 40 MB, then close
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -53,6 +54,8 @@ class Handler(BaseHTTPRequestHandler):
         # /permalink/2026-10-01_istdaten.csv
         if self.path.startswith("/permalink/"):
             day = self.path.split("/")[-1][:10]
+            if day in Source.truncate_days:
+                return self._send_truncated(csv_for(day, Source.version))
             body = (b"<html>challenge</html>" if day in Source.html_days
                     else csv_for(day, Source.version))
             return self._send(200, body)
@@ -67,10 +70,23 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError:
                         break
                     if day not in Source.missing_in_zip:
-                        z.writestr(f"{Source.zip_prefix}{day}_istdaten.csv",
+                        z.writestr(f"{Source.zip_prefix}{day}_IstDaten.csv",
                                    csv_for(day, Source.version))
             return self._send(200, buf.getvalue())
         self._send(404, b"not found")
+
+    def _send_truncated(self, head):
+        # Larger than one upload chunk (16 MiB), so the resumable upload has
+        # already started when the connection breaks.
+        self.send_response(200)
+        self.send_header("Content-Length", str(40 * 1024 * 1024))
+        self.end_headers()
+        self.wfile.write(head)
+        filler = b"x" * (1024 * 1024)
+        for _ in range(20):
+            self.wfile.write(filler)
+        self.wfile.flush()
+        self.close_connection = True
 
     def _send(self, code, body):
         self.send_response(code)
@@ -89,47 +105,42 @@ class EndToEnd(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.src_port = free_port()
-        cls.moto = None
-        cls.s3_endpoint = os.environ.get("E2E_S3_ENDPOINT")
-        cls.s3_key = os.environ.get("E2E_S3_ACCESS_KEY_ID", "test")
-        cls.s3_secret = os.environ.get("E2E_S3_SECRET_ACCESS_KEY", "test")
-        if not cls.s3_endpoint:
-            port = free_port()
-            cls.s3_endpoint = f"http://127.0.0.1:{port}"
-            cls.moto = subprocess.Popen(
-                [sys.executable, "-m", "moto.server", "-p", str(port)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        port = free_port()
+        cls.emulator_host = f"http://127.0.0.1:{port}"
+        cls.emulator = subprocess.Popen(
+            [sys.executable, "-m", "gcp_storage_emulator", "start", "--host", "127.0.0.1",
+             "--port", str(port), "--in-memory", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         cls.http = ThreadingHTTPServer(("127.0.0.1", cls.src_port), Handler)
         threading.Thread(target=cls.http.serve_forever, daemon=True).start()
         cls.tmp = tempfile.mkdtemp(prefix="fetcher-scratch-")
-        cls.s3 = boto3.client("s3", endpoint_url=cls.s3_endpoint,
-                              aws_access_key_id=cls.s3_key,
-                              aws_secret_access_key=cls.s3_secret,
-                              region_name="us-east-1",
-                              config=BotoConfig(s3={"addressing_style": "path"}))
+        os.environ["STORAGE_EMULATOR_HOST"] = cls.emulator_host   # for this process's client
+        cls.gcs = storage.Client(project=PROJECT)
         for _ in range(50):
             try:
-                cls.s3.list_buckets(); break
+                cls.bucket = cls.gcs.create_bucket(BUCKET); break
             except Exception:
                 time.sleep(0.2)
+        else:
+            raise RuntimeError("GCS emulator did not start")
 
     @classmethod
     def tearDownClass(cls):
-        if cls.moto:
-            cls.moto.terminate()
+        cls.emulator.terminate()
         cls.http.shutdown()
+        os.environ.pop("STORAGE_EMULATOR_HOST", None)
 
     def setUp(self):
         Source.version, Source.html_days, Source.missing_in_zip = 1, set(), set()
+        Source.truncate_days = set()
         Source.zip_prefix = ""
         Source.hits.clear()
 
     def run_cli(self, *args, **env_overrides):
         env = {
             "PATH": os.environ["PATH"],
-            "S3_ENDPOINT_URL": self.s3_endpoint,
-            "S3_ACCESS_KEY_ID": self.s3_key, "S3_SECRET_ACCESS_KEY": self.s3_secret,
-            "S3_BUCKET": BUCKET, "S3_CREATE_BUCKET": "true",
+            "STORAGE_EMULATOR_HOST": self.emulator_host,
+            "GCS_BUCKET": BUCKET, "GCP_PROJECT_ID": PROJECT,
             "PERMALINK_URL_TEMPLATE": f"http://127.0.0.1:{self.src_port}/permalink/{{day}}_istdaten.csv",
             "ARCHIVE_URL_TEMPLATE": f"http://127.0.0.1:{self.src_port}/archive/{{year}}/{{year}}-{{month}}.zip",
             "FETCHER_REFERENCE_DATE": "2026-10-03",
@@ -141,18 +152,14 @@ class EndToEnd(unittest.TestCase):
         return p.returncode, p.stdout + p.stderr
 
     def get(self, day):
-        return self.s3.get_object(Bucket=BUCKET, Key=f"raw/{day}_istdaten.csv")["Body"].read()
+        return self.bucket.blob(f"raw/{day}_istdaten.csv").download_as_bytes()
 
     def keys(self):
-        try:
-            r = self.s3.list_objects_v2(Bucket=BUCKET)
-        except self.s3.exceptions.NoSuchBucket:
-            return []
-        return sorted(o["Key"] for o in r.get("Contents", []))
+        return sorted(b.name for b in self.gcs.list_blobs(BUCKET))
 
     def clear_bucket(self):
         for k in self.keys():
-            self.s3.delete_object(Bucket=BUCKET, Key=k)
+            self.bucket.blob(k).delete()
 
     # ------------------------------------------------------------------ tests
     def test_01_range_across_month_boundary_then_idempotent_then_force(self):
@@ -217,6 +224,17 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertEqual(self.get("2026-10-01"), csv_for("2026-10-01", 1))
 
+    def test_04b_broken_download_keeps_existing_object(self):
+        # The source drops the connection in the middle of a large file. The
+        # upload is cancelled: the old object stays, no partial file appears.
+        self.clear_bucket()
+        self.run_cli("--date", "2026-10-01")
+        Source.truncate_days = {"2026-10-01"}
+        code, out = self.run_cli("--date", "2026-10-01", "--force-overwrite")
+        self.assertEqual(code, 1, out)
+        self.assertIn("status=FAILED", out)
+        self.assertEqual(self.get("2026-10-01"), csv_for("2026-10-01", 1))
+
     def test_05_unreachable_archive_fails_and_cleans_up(self):
         code, out = self.run_cli(
             "--date", "2026-08-01", "--force-overwrite",
@@ -234,7 +252,7 @@ class EndToEnd(unittest.TestCase):
                      []):
             code, out = self.run_cli(*args)
             self.assertEqual(code, 2, f"{args}: {out}")
-        code, out = self.run_cli("--date", "2026-10-01", S3_BUCKET="")
+        code, out = self.run_cli("--date", "2026-10-01", GCS_BUCKET="")
         self.assertEqual(code, 2, out)
         code, out = self.run_cli("--date", "2026-10-01", FETCHER_REFERENCE_DATE="garbage")
         self.assertEqual(code, 2, out)
@@ -271,18 +289,19 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("not found in archive", out)
         self.assertEqual(self.keys(), [])
 
-    def test_09_bucket_must_exist_when_creation_disabled(self):
-        code, out = self.run_cli("--date", "2026-10-01", S3_BUCKET="does-not-exist-xyz",
-                                 S3_CREATE_BUCKET="false", S3_BUCKET_WAIT_SECONDS="3")
+    def test_09_bucket_must_exist(self):
+        # The fetcher never creates the bucket (Terraform does): exit 2, no download.
+        Source.hits.clear()
+        code, out = self.run_cli("--date", "2026-10-01", GCS_BUCKET="does-not-exist-xyz")
         self.assertEqual(code, 2, out)
         self.assertIn("does not exist", out)
+        self.assertEqual(sum(Source.hits.values()), 0)
 
     def test_10_inventory_lists_raw_objects(self):
         self.clear_bucket()
         self.run_cli("--start-date", "2026-10-01", "--end-date", "2026-10-02")
-        env = {"PATH": os.environ["PATH"], "S3_ENDPOINT_URL": self.s3_endpoint,
-               "S3_ACCESS_KEY_ID": self.s3_key, "S3_SECRET_ACCESS_KEY": self.s3_secret,
-               "S3_BUCKET": BUCKET}
+        env = {"PATH": os.environ["PATH"], "STORAGE_EMULATOR_HOST": self.emulator_host,
+               "GCS_BUCKET": BUCKET, "GCP_PROJECT_ID": PROJECT}
         p = subprocess.run([sys.executable, "-m", "app.inventory"], cwd=ROOT, env=env,
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -292,8 +311,7 @@ class EndToEnd(unittest.TestCase):
     def test_11_empty_template_env_falls_back_to_default(self):
         # Compose passes VAR= for unset vars; must not crash, must use defaults.
         from app.config import Config, DEFAULT_ARCHIVE_URL_TEMPLATE
-        os.environ.update({"S3_ACCESS_KEY_ID": "x", "S3_SECRET_ACCESS_KEY": "x",
-                           "S3_BUCKET": "b", "ARCHIVE_URL_TEMPLATE": ""})
+        os.environ.update({"GCS_BUCKET": "b", "ARCHIVE_URL_TEMPLATE": ""})
         self.assertEqual(Config.from_env().archive_url_template, DEFAULT_ARCHIVE_URL_TEMPLATE)
 
 
