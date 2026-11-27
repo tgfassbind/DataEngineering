@@ -1,3 +1,4 @@
-# Test-only dependencies: none beyond the runtime set.
-# The e2e tests talk to the real object storage and PostgreSQL services.
+# Test-only dependencies
 -r requirements.txt
+# Local Cloud Storage emulator for the end-to-end tests
+gcp-storage-emulator==2026.7.19

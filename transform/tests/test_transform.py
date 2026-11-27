@@ -1,4 +1,4 @@
-"""Read + validate + compute, without S3 or PostgreSQL.
+"""Read + validate + compute + Parquet output, without Cloud Storage.
 
 Expected numbers are derived from the fixture with the csv module in the
 test itself, never from the transform code.
@@ -11,12 +11,13 @@ import unittest
 from unittest import mock
 from collections import Counter
 from datetime import date, datetime
-from app.compute import build_rows, row_hash, to_records
 
 import pandas as pd
+import pyarrow.parquet as pq
 
-from app.compute import build_rows
+from app.compute import OUTPUT_COLUMNS, build_rows
 from app.config import ConfigError, Limits, Line, parse_line_spec, resolve_lines
+from app.output import run_scope_table, stop_events_table, to_parquet_bytes
 from app.read import RawFileInvalid, filter_chunks
 from app.validate import validate
 from tests.helpers import FIXTURE, fixture_rows, make_row, to_csv_bytes
@@ -171,7 +172,7 @@ class FixtureTransform(unittest.TestCase):
         key = ["fahrt_bezeichner", "bpuic"]
         a = self.out.sort_values(key).reset_index(drop=True)
         b = out2.sort_values(key).reset_index(drop=True)
-        self.assertEqual(list(a["row_hash"]), list(b["row_hash"]))
+        pd.testing.assert_frame_equal(a, b)
 
     def test_additional_trips_kept(self):
         want = sum(1 for r in self.raw if r["ZUSATZFAHRT_TF"] == "true" and r["FAELLT_AUS_TF"] != "true")
@@ -180,7 +181,7 @@ class FixtureTransform(unittest.TestCase):
 
     def test_line_attributes_passed_through(self):
         """betreiber_name, verkehrsmittel_text and produkt_id reach the output
-        unchanged (stripped) and are not part of the row hash."""
+        unchanged (stripped) for the dimension dim_line in BigQuery."""
         raw = {(r["FAHRT_BEZEICHNER"].strip(), int(r["BPUIC"])):
                (r["BETREIBER_NAME"].strip(), r["VERKEHRSMITTEL_TEXT"].strip(),
                 r["PRODUKT_ID"].strip())
@@ -188,14 +189,13 @@ class FixtureTransform(unittest.TestCase):
         for row in self.out.itertuples():
             self.assertEqual((row.betreiber_name, row.verkehrsmittel_text, row.produkt_id),
                              raw[(row.fahrt_bezeichner, row.bpuic)])
-        changed = self.out.assign(betreiber_name="other")
-        self.assertEqual([row_hash(r) for r in to_records(changed)], list(self.out["row_hash"]))
 
-    def test_hash_is_sha256_and_deterministic(self):
-        self.assertTrue(self.out["row_hash"].str.fullmatch(r"[0-9a-f]{64}").all())
-        self.assertEqual(self.out["row_hash"].nunique(), len(self.out))
+    def test_unique_key_and_independent_of_chunk_size(self):
+        """(fahrt_bezeichner, bpuic) is unique per day - the fact key that
+        10_load_core.sql asserts - and the chunk size does not change the result."""
+        self.assertFalse(self.out.duplicated(["fahrt_bezeichner", "bpuic"]).any())
         _, again, _ = run(FIXTURE.read_bytes(), chunk_size=1000)
-        self.assertEqual(list(self.out["row_hash"]), list(again["row_hash"]))
+        pd.testing.assert_frame_equal(self.out, again)
 
 
 class ValidationRules(unittest.TestCase):
@@ -332,7 +332,7 @@ class ValidationRules(unittest.TestCase):
     def test_empty_input(self):
         _, out, _ = run(to_csv_bytes([make_row("A", 1, "a", dep="10:00", line="S9")]))
         self.assertEqual(len(out), 0)
-        self.assertEqual(list(out.columns)[-1], "row_hash")
+        self.assertEqual(list(out.columns), OUTPUT_COLUMNS)
 
     def test_duplicate_key_keeps_first_by_sequence(self):
         rows = self.trip(dict(dep="10:00", dep_act="10:00:00", dep_status="REAL"),
@@ -393,6 +393,51 @@ class ReadAndLines(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TRANSFORM_LINES_FILE": ""}):
             lines, _ = resolve_lines(None)        # shipped config/lines.yml
         self.assertEqual(lines, [Line("IR75", "SBB", (8502202,)), Line("S1", "SBB", (8502202,))])
+
+
+class ParquetOutput(unittest.TestCase):
+    """The files Kestra loads into BigQuery: types, NULLs, text timestamps."""
+
+    @classmethod
+    def setUpClass(cls):
+        _, cls.out, _ = run(FIXTURE.read_bytes())
+        cls.table = pq.read_table(io.BytesIO(to_parquet_bytes(stop_events_table(cls.out))))
+
+    def test_schema(self):
+        self.assertEqual(self.table.schema.names, OUTPUT_COLUMNS)
+        types = {f.name: str(f.type) for f in self.table.schema}
+        self.assertEqual(types["betriebstag"], "date32[day]")
+        self.assertEqual(types["sched_arr"], "string")
+        for col in ("bpuic", "stop_sequence", "arr_delay_s", "dep_delay_s"):
+            self.assertEqual(types[col], "int64", col)
+        self.assertEqual(types["is_additional_trip"], "bool")
+
+    def test_values_survive_the_round_trip(self):
+        back = self.table.to_pandas()
+        self.assertEqual(len(back), len(self.out))
+        self.assertEqual(set(back["betriebstag"]), {DAY})
+        # first stops have no arrival, last stops no departure: NULL, not ""
+        self.assertEqual(int(back["sched_arr"].isna().sum()), int(self.out["sched_arr"].isna().sum()))
+        self.assertEqual(int(back["arr_delay_s"].isna().sum()),
+                         int(self.out["arr_delay_s"].isna().sum()))
+        filled = back["sched_dep"].dropna()
+        self.assertTrue(filled.str.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}").all())
+        expected = self.out["sched_dep"].dropna().dt.strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(list(filled), list(expected))
+        self.assertEqual(list(back["dep_delay_s"].fillna(-999999)),
+                         list(self.out["dep_delay_s"].fillna(-999999)))
+
+    def test_empty_day_still_has_schema(self):
+        _, empty, _ = run(to_csv_bytes([make_row("A", 1, "a", dep="10:00", line="S9")]))
+        table = pq.read_table(io.BytesIO(to_parquet_bytes(stop_events_table(empty))))
+        self.assertEqual((table.num_rows, table.schema.names), (0, OUTPUT_COLUMNS))
+
+    def test_run_scope_one_row_per_line(self):
+        lines = [Line("IR75", "SBB", (8502202,)), Line("IR75", "SBB"), Line("S1", "SBB")]
+        scope = run_scope_table(DAY, lines).to_pylist()
+        self.assertEqual(scope, [
+            {"betriebstag": DAY, "linien_text": "IR75", "betreiber_abk": "SBB"},
+            {"betriebstag": DAY, "linien_text": "S1", "betreiber_abk": "SBB"}])
 
 
 if __name__ == "__main__":
