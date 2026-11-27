@@ -40,6 +40,12 @@ kestra:
         values:
           volume-enabled: true
 
+  # bigquery/sql/ of the repo, mounted read-only; the flows read the SQL with
+  # read('file:///app/deng/sql/<file>.sql')
+  local-files:
+    allowed-paths:
+      - /app/deng/sql
+
   tutorial-flows:
     enabled: false
   anonymous-usage-report:

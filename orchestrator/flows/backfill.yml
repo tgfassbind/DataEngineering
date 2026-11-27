@@ -1,5 +1,10 @@
-# The pipeline engine: fetch -> transform -> aggregate for one date range.
-# Fetch and transform run as `docker compose run --rm <service>`
+# The pipeline engine for one date range:
+#   fetch -> transform -> load into BigQuery (per day) -> refresh the data mart
+#
+# Fetch and transform run as `docker compose run --rm <service>` on the host;
+# the BigQuery steps run as Kestra GCP tasks with the pipeline service account
+# (GOOGLE_APPLICATION_CREDENTIALS in the kestra container). The SQL comes from
+# bigquery/sql/ in the repo (mounted read-only at /app/deng/sql).
 #
 # Loaded automatically at Kestra startup from orchestrator/flows/ (--flow-path).
 # Edits made in the UI are overwritten at the next start of the kestra container.
@@ -9,18 +14,22 @@
 id: backfill
 namespace: deng
 description: |
-  Fetch, transform and aggregate SBB Ist-Daten for an inclusive date range.
+  Fetch, transform and load SBB Ist-Daten for an inclusive date range.
 
-  * `full`: fetch (`--start-date/--end-date`) -> transform (upsert) -> `CALL reporting.refresh_od_delay()`
-  * `fetch_only`: fetch only (staging and reporting untouched)
-  * `transform_only`: transform with `--retransform` -> aggregation (raw files untouched)
+  * `full`: fetch -> transform -> load each day into BigQuery -> refresh the data mart
+  * `fetch_only`: fetch only (BigQuery untouched)
+  * `transform_only`: transform -> load -> refresh (raw files untouched)
+  * `load_only`: load the existing files in `processed/` -> refresh (nothing recomputed)
 
-  The raw files in object storage are only replaced with `force_overwrite: true`.
+  Raw files in the bucket are only replaced with `force_overwrite: true`.
+  Loading a day replaces exactly that day and the processed lines in
+  `core.fact_stop_event` (bigquery/sql/10_load_core.sql), so every mode can be rerun.
 
 labels:
   project: deng
 
-# One pipeline run at a time (daily + manual backfills queue up)
+# One pipeline run at a time (daily + manual backfills queue up). Required: the
+# load tables core.stg_* are shared by all runs.
 concurrency:
   limit: 1
   behavior: QUEUE
@@ -43,12 +52,13 @@ inputs:
       - full
       - fetch_only
       - transform_only
+      - load_only
     defaults: full
 
   - id: force_overwrite
     type: BOOL
     displayName: Force overwrite raw files
-    description: Passed to the fetcher as --force-overwrite (re-download days that are already stored). Ignored in transform_only.
+    description: Passed to the fetcher as --force-overwrite (re-download days that are already stored). Only used in full and fetch_only.
     defaults: false
 
   - id: lines
@@ -56,7 +66,7 @@ inputs:
     displayName: Lines override (optional)
     description: |
       Passed to the transform as --lines, e.g. `IR75:SBB,S1:SBB` or `S1:SBB@8502202`.
-      Empty = transform/config/lines.yml. The fixture acceptance numbers (445 rows / 1914 rows) need `IR75:SBB,S1:SBB`.
+      Empty = transform/config/lines.yml. Only used in full and transform_only.
     required: false
     validator: "^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+(@[0-9]+(\\+[0-9]+)*)?(,[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+(@[0-9]+(\\+[0-9]+)*)?)*$"
 
@@ -66,7 +76,7 @@ variables:
   compose_image: docker:27.5.1-cli
 
 tasks:
-  # validation
+  # ---------------------------------------------------------------- checks
   - id: label_run
     type: io.kestra.plugin.core.execution.Labels
     labels:
@@ -86,23 +96,23 @@ tasks:
 
   - id: find_fetcher_image
     type: io.kestra.plugin.docker.cli.ImageLs
-    runIf: "{{ inputs.mode != 'transform_only' }}"
+    runIf: "{{ inputs.mode == 'full' or inputs.mode == 'fetch_only' }}"
     imageNameFilter: "{{ vars.fetcher_image }}"
 
   - id: check_fetcher_image
     type: io.kestra.plugin.core.execution.Fail
-    runIf: "{{ inputs.mode != 'transform_only' }}"
+    runIf: "{{ inputs.mode == 'full' or inputs.mode == 'fetch_only' }}"
     condition: "{{ outputs.find_fetcher_image.count == 0 }}"
     errorMessage: "Docker image {{ vars.fetcher_image }} not found. Build the job images first: docker compose --profile jobs build"
 
   - id: find_transform_image
     type: io.kestra.plugin.docker.cli.ImageLs
-    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    runIf: "{{ inputs.mode == 'full' or inputs.mode == 'transform_only' }}"
     imageNameFilter: "{{ vars.transform_image }}"
 
   - id: check_transform_image
     type: io.kestra.plugin.core.execution.Fail
-    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    runIf: "{{ inputs.mode == 'full' or inputs.mode == 'transform_only' }}"
     condition: "{{ outputs.find_transform_image.count == 0 }}"
     errorMessage: "Docker image {{ vars.transform_image }} not found. Build the job images first: docker compose --profile jobs build"
 
@@ -117,10 +127,10 @@ tasks:
     volumes:
       - "{{ envs.host_project_dir }}:{{ envs.host_project_dir }}:ro"
 
-  # fetch
+  # ---------------------------------------------------------------- fetch: source -> gs://.../raw/
   - id: fetch
     type: io.kestra.plugin.docker.cli.Run
-    runIf: "{{ inputs.mode != 'transform_only' }}"
+    runIf: "{{ inputs.mode == 'full' or inputs.mode == 'fetch_only' }}"
     containerImage: "{{ vars.compose_image }}"
     entryPoint: ["/bin/sh", "-c"]
     commands:
@@ -153,14 +163,14 @@ tasks:
 
   - id: fetch_exit_code
     type: io.kestra.plugin.core.execution.Fail
-    runIf: "{{ inputs.mode != 'transform_only' }}"
+    runIf: "{{ inputs.mode == 'full' or inputs.mode == 'fetch_only' }}"
     condition: "{{ (outputs.fetch.vars.exitCode ?? -1) != 0 }}"
-    errorMessage: "{% if (outputs.fetch.vars.exitCode ?? -1) == 2 %}Fetcher exited with code 2: invalid arguments or configuration (S3 credentials, bucket, FETCHER_TIMEZONE, FETCHER_REFERENCE_DATE ...). Not retried.{% else %}Fetcher exit code unknown (no exit code line in the output).{% endif %} See the logs of the fetch task."
+    errorMessage: "{% if (outputs.fetch.vars.exitCode ?? -1) == 2 %}Fetcher exited with code 2: invalid arguments or configuration (GCS_BUCKET, pipeline key, bucket permissions, FETCHER_TIMEZONE ...). Not retried.{% else %}Fetcher exit code unknown (no exit code line in the output).{% endif %} See the logs of the fetch task."
 
-  # transform
+  # ---------------------------------------------------------------- transform: raw/ -> processed/
   - id: transform
     type: io.kestra.plugin.docker.cli.Run
-    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    runIf: "{{ inputs.mode == 'full' or inputs.mode == 'transform_only' }}"
     containerImage: "{{ vars.compose_image }}"
     entryPoint: ["/bin/sh", "-c"]
     commands:
@@ -172,7 +182,7 @@ tasks:
             --profile jobs \
             run --rm --no-deps -T transform \
             --start-date {{ inputs.start_date | date('yyyy-MM-dd') }} \
-            --end-date {{ inputs.end_date | date('yyyy-MM-dd') }}{% if inputs.mode == 'transform_only' %} --retransform{% endif %}{% if (inputs.lines ?? '') is not empty %} --lines '{{ inputs.lines }}'{% endif %} 2>&1
+            --end-date {{ inputs.end_date | date('yyyy-MM-dd') }}{% if (inputs.lines ?? '') is not empty %} --lines '{{ inputs.lines }}'{% endif %} 2>&1
           echo "__rc=$?"; } | awk '
           /^__rc=/ { if (buf != "") print buf; sub(/^__rc=/, ""); rc = $0 + 0; buf = ""; fflush(); next }
           /^ ?(Container|Network|Volume) .* (Creating|Created|Starting|Started|Running|Waiting|Healthy)$/ { next }
@@ -185,15 +195,82 @@ tasks:
       - "{{ envs.host_project_dir }}:{{ envs.host_project_dir }}:ro"
     timeout: PT3H
 
-  # aggregate
-  - id: aggregate
-    type: io.kestra.plugin.jdbc.postgresql.Query
+  # ---------------------------------------------------------------- load: processed/ -> BigQuery
+  # List of the operating days in the range, as output `days` (busybox date).
+  - id: days
+    type: io.kestra.plugin.docker.cli.Run
     runIf: "{{ inputs.mode != 'fetch_only' }}"
-    url: "jdbc:postgresql://{{ envs.postgres_host }}:{{ envs.postgres_port }}/{{ envs.postgres_db }}"
-    username: "{{ envs.postgres_user }}"
-    password: "{{ secret('POSTGRES_PASSWORD') }}"
-    sql: CALL reporting.refresh_od_delay();
-    fetchType: NONE
+    containerImage: "{{ vars.compose_image }}"
+    entryPoint: ["/bin/sh", "-c"]
+    commands:
+      - |
+        set -e
+        t=$(date -u -d '{{ inputs.start_date | date('yyyy-MM-dd') }} 00:00' +%s)
+        last=$(date -u -d '{{ inputs.end_date | date('yyyy-MM-dd') }} 00:00' +%s)
+        days=""
+        while [ "$t" -le "$last" ]; do
+          days="$days${days:+,}\"$(date -u -d "@$t" +%F)\""
+          t=$((t + 86400))
+        done
+        echo "::{\"outputs\":{\"days\":[$days]}}::"
+
+  # One day after the other (the load tables are shared): load both files of
+  # the day, then move them into the star schema in one transaction.
+  - id: load_days
+    type: io.kestra.plugin.core.flow.Loop
+    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    values: "{{ outputs.days.vars.days | toJson }}"
+    concurrencyLimit: 1
+    tasks:
+      - id: load_stop_events
+        type: io.kestra.plugin.gcp.bigquery.LoadFromGcs
+        projectId: "{{ envs.gcp_project_id }}"
+        location: "{{ envs.gcp_location }}"
+        from:
+          - "gs://{{ envs.gcs_bucket }}/processed/{{ item.value }}_stop_events.parquet"
+        destinationTable: "{{ envs.gcp_project_id }}.core.stg_stop_event"
+        format: PARQUET
+        createDisposition: CREATE_IF_NEEDED
+        writeDisposition: WRITE_TRUNCATE
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempts: 3
+
+      - id: load_run_scope
+        type: io.kestra.plugin.gcp.bigquery.LoadFromGcs
+        projectId: "{{ envs.gcp_project_id }}"
+        location: "{{ envs.gcp_location }}"
+        from:
+          - "gs://{{ envs.gcs_bucket }}/processed/{{ item.value }}_run_scope.parquet"
+        destinationTable: "{{ envs.gcp_project_id }}.core.stg_run_scope"
+        format: PARQUET
+        createDisposition: CREATE_IF_NEEDED
+        writeDisposition: WRITE_TRUNCATE
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempts: 3
+
+      - id: load_core
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ envs.gcp_project_id }}"
+        location: "{{ envs.gcp_location }}"
+        sql: "{{ read('file:///app/deng/sql/10_load_core.sql') }}"
+        fetchType: FETCH_ONE
+        retry:
+          type: constant
+          interval: PT1M
+          maxAttempts: 3
+
+  # ---------------------------------------------------------------- data mart
+  - id: refresh_mart
+    type: io.kestra.plugin.gcp.bigquery.Query
+    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    projectId: "{{ envs.gcp_project_id }}"
+    location: "{{ envs.gcp_location }}"
+    sql: "{{ read('file:///app/deng/sql/20_refresh_mart.sql') }}"
+    fetchType: FETCH_ONE
     timeout: PT30M
     retry:
       type: constant
@@ -202,18 +279,17 @@ tasks:
 
   # Read-only summary for the UI
   - id: summary
-    type: io.kestra.plugin.jdbc.postgresql.Query
+    type: io.kestra.plugin.gcp.bigquery.Query
     runIf: "{{ inputs.mode != 'fetch_only' }}"
-    url: "jdbc:postgresql://{{ envs.postgres_host }}:{{ envs.postgres_port }}/{{ envs.postgres_db }}"
-    username: "{{ envs.postgres_user }}"
-    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    projectId: "{{ envs.gcp_project_id }}"
+    location: "{{ envs.gcp_location }}"
     sql: |
       SELECT
-        (SELECT count(*) FROM staging.stop_events
-          WHERE betriebstag BETWEEN DATE '{{ inputs.start_date | date('yyyy-MM-dd') }}' AND DATE '{{ inputs.end_date | date('yyyy-MM-dd') }}') AS staging_rows_in_range,
-        (SELECT count(DISTINCT (betriebstag, fahrt_bezeichner)) FROM staging.stop_events
-          WHERE betriebstag BETWEEN DATE '{{ inputs.start_date | date('yyyy-MM-dd') }}' AND DATE '{{ inputs.end_date | date('yyyy-MM-dd') }}') AS staging_trips_in_range,
-        (SELECT count(*) FROM reporting.od_delay_by_slot) AS reporting_rows
+        (SELECT COUNT(*) FROM core.fact_stop_event
+          WHERE betriebstag BETWEEN DATE '{{ inputs.start_date | date('yyyy-MM-dd') }}' AND DATE '{{ inputs.end_date | date('yyyy-MM-dd') }}') AS fact_rows_in_range,
+        (SELECT COUNT(DISTINCT FORMAT('%t|%s', betriebstag, fahrt_bezeichner)) FROM core.fact_stop_event
+          WHERE betriebstag BETWEEN DATE '{{ inputs.start_date | date('yyyy-MM-dd') }}' AND DATE '{{ inputs.end_date | date('yyyy-MM-dd') }}') AS trips_in_range,
+        (SELECT COUNT(*) FROM mart.mart_od_delay_by_slot) AS mart_rows
     fetchType: FETCH_ONE
 
   - id: log_summary
@@ -221,6 +297,6 @@ tasks:
     runIf: "{{ inputs.mode != 'fetch_only' }}"
     message: >-
       Run OK ({{ inputs.mode }}, {{ inputs.start_date | date('yyyy-MM-dd') }}..{{ inputs.end_date | date('yyyy-MM-dd') }}):
-      staging rows in range={{ outputs.summary.row.staging_rows_in_range }},
-      trips in range={{ outputs.summary.row.staging_trips_in_range }},
-      reporting.od_delay_by_slot rows={{ outputs.summary.row.reporting_rows }}
+      fact rows in range={{ outputs.summary.row.fact_rows_in_range }},
+      trips in range={{ outputs.summary.row.trips_in_range }},
+      mart.mart_od_delay_by_slot rows={{ outputs.summary.row.mart_rows }}

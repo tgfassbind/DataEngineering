@@ -1,0 +1,51 @@
+# One-time setup of the BigQuery tables, run by hand after `terraform apply`:
+#   01_tables.sql        key functions, dimensions, fact, data mart
+#   02_seed_calendar.sql dim_date and dim_time_slot
+# The datasets core and mart must exist (created by Terraform). Both scripts are
+# idempotent: running the flow again changes nothing. A changed table definition
+# is NOT applied to an existing table (CREATE TABLE IF NOT EXISTS).
+id: setup_bigquery
+namespace: deng
+description: |
+  Create the BigQuery tables (bigquery/sql/01_tables.sql) and fill the calendar
+  dimensions (02_seed_calendar.sql). Run once after `terraform apply`; safe to rerun.
+
+labels:
+  project: deng
+
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+tasks:
+  - id: create_tables
+    type: io.kestra.plugin.gcp.bigquery.Query
+    projectId: "{{ envs.gcp_project_id }}"
+    location: "{{ envs.gcp_location }}"
+    sql: "{{ read('file:///app/deng/sql/01_tables.sql') }}"
+
+  - id: seed_calendar
+    type: io.kestra.plugin.gcp.bigquery.Query
+    projectId: "{{ envs.gcp_project_id }}"
+    location: "{{ envs.gcp_location }}"
+    sql: "{{ read('file:///app/deng/sql/02_seed_calendar.sql') }}"
+
+  - id: check
+    type: io.kestra.plugin.gcp.bigquery.Query
+    projectId: "{{ envs.gcp_project_id }}"
+    location: "{{ envs.gcp_location }}"
+    sql: |
+      SELECT
+        (SELECT COUNT(*) FROM core.dim_date) AS dim_date_rows,
+        (SELECT COUNT(*) FROM core.dim_time_slot) AS dim_time_slot_rows,
+        (SELECT COUNT(*) FROM core.INFORMATION_SCHEMA.TABLES) AS core_tables,
+        (SELECT COUNT(*) FROM mart.INFORMATION_SCHEMA.TABLES) AS mart_tables
+    fetchType: FETCH_ONE
+
+  - id: log_check
+    type: io.kestra.plugin.core.log.Log
+    message: >-
+      BigQuery ready: core tables={{ outputs.check.row.core_tables }},
+      mart tables={{ outputs.check.row.mart_tables }},
+      dim_date rows={{ outputs.check.row.dim_date_rows }},
+      dim_time_slot rows={{ outputs.check.row.dim_time_slot_rows }}
