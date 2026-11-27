@@ -1,0 +1,10 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+keys/
+terraform.tfvars
+
+# Keep the .tf files and .terraform.lock.hcl in version control.

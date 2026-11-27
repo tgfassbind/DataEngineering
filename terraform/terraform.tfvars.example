@@ -1,0 +1,5 @@
+# Copy to terraform.tfvars (ignored by Git) and adjust.
+# Terraform loads terraform.tfvars automatically; it ignores this .example file.
+project_id  = "YOUR_PROJECT_ID"
+bucket_name = "YOUR_PROJECT_ID-lake" # must be globally unique
+location    = "EU"
