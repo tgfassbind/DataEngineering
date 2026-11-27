@@ -27,5 +27,5 @@ virtualenv/
 .com.apple.timemachine.donotpresent
 Icon?
 
-# test cache
-db/tests/__pycache__
+# Python caches
+__pycache__/
