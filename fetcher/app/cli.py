@@ -19,6 +19,8 @@ import sys
 from collections import Counter
 from datetime import date
 
+from google.auth.exceptions import DefaultCredentialsError
+
 from .config import Config, ConfigError
 from .fetch import Fetcher, Status
 from .routing import expand_range, route, today_in
@@ -49,8 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     """
     p = argparse.ArgumentParser(
         prog="fetcher",
-        description="Fetch SBB Ist-Daten v2 daily CSVs into object storage "
-                    "(raw/YYYY-MM-DD_istdaten.csv).")
+        description="Fetch SBB Ist-Daten v2 daily CSVs into the data lake "
+                    "(gs://GCS_BUCKET/raw/YYYY-MM-DD_istdaten.csv).")
     sel = p.add_mutually_exclusive_group(required=True)
     sel.add_argument("--date", type=_iso, help="single day, YYYY-MM-DD")
     sel.add_argument("--start-date", type=_iso, help="range start (inclusive)")
@@ -112,12 +114,12 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Run: %d date(s) %s..%s, today=%s (%s%s), force_overwrite=%s, bucket=%s",
              len(days), days[0], days[-1], today, cfg.timezone,
              ", pinned via FETCHER_REFERENCE_DATE" if cfg.reference_date else "",
-             args.force_overwrite, cfg.s3_bucket)
+             args.force_overwrite, cfg.gcs_bucket)
 
-    store = ObjectStore(cfg)
     try:
-        store.ensure_bucket(create=cfg.s3_create_bucket, wait_s=cfg.s3_bucket_wait_s)
-    except ConfigError as e:
+        store = ObjectStore(cfg)
+        store.check_bucket()
+    except (ConfigError, DefaultCredentialsError) as e:
         log.error("Configuration error: %s", e)
         return 2
     results = Fetcher(cfg, store, args.force_overwrite).run(days, today)

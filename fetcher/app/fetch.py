@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 
 CHUNK = 1024 * 1024
 USER_AGENT = "deng-datapipeline-fetcher/1.0"
-# Member names inside the monthly ZIP: "YYYY-MM-DD_istdaten.csv" at the ZIP
+# Member names inside the monthly ZIP: "YYYY-MM-DD_IstDaten.csv" at the ZIP
 # root, no sub-folders. Matched strictly so
 # a format change upstream fails loudly instead of silently picking odd files.
 MEMBER_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_IstDaten\.csv$")

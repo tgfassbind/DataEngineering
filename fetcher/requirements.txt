@@ -1,14 +1,23 @@
 # Direct dependencies needed by the fetcher
 requests==2.32.3
-boto3==1.35.99
+google-cloud-storage==3.17.2
 
 # Transitive dependencies, do not change. Keeps the build deterministic
-botocore==1.35.99
-s3transfer==0.10.4
-jmespath==1.1.0
-python-dateutil==2.9.0.post0
-six==1.17.0
-urllib3==2.8.0
-certifi==2026.7.22
-charset-normalizer==3.5.2
+# (installed with --no-deps + pip check). Resolved for Python 3.12.
+certifi==2026.11.20
+cffi==2.1.1
+charset-normalizer==3.5.3
+cryptography==50.0.2
+google-api-core==2.30.3
+google-auth==2.63.1
+google-cloud-core==2.8.0
+google-crc32c==1.9.0
+google-resumable-media==2.11.0
+googleapis-common-protos==1.76.0
 idna==3.20
+proto-plus==1.29.0
+protobuf==7.36.2
+pyasn1==0.6.5
+pyasn1_modules==0.4.2
+pycparser==3.12
+urllib3==2.8.0
