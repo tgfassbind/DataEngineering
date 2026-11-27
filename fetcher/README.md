@@ -1,7 +1,8 @@
 # Fetcher
 
 Batch job that downloads the SBB actual data ("Ist-Daten", Open Transport Data Swiss)
-for one or more operating days and stores each day **unchanged** in object storage.
+for one or more operating days and stores each day **unchanged** in the data lake
+(Google Cloud Storage bucket, created by Terraform).
 It is the first step of the pipeline; the transform job reads its output.
 
 ## Folder structure
@@ -14,11 +15,11 @@ fetcher/
 │   ├── config.py        reads all settings from environment variables, storage key contract
 │   ├── routing.py       pure logic: which source (permalink / archive) for which date
 │   ├── fetch.py         per-date processing: existence check, download, ZIP extraction, upload
-│   ├── storage.py       thin wrapper around the S3 API (boto3)
-│   └── inventory.py     lists the stored raw files (key, size, ETag)
+│   ├── storage.py       thin wrapper around Cloud Storage (google-cloud-storage)
+│   └── inventory.py     lists the stored raw files (name, size, MD5)
 ├── tests/
 │   ├── test_routing.py  unit tests of the routing rules (no I/O)
-│   └── test_e2e.py      runs the real CLI against an S3 emulator (moto) and mocked SBB sources
+│   └── test_e2e.py      runs the real CLI against a GCS emulator and mocked SBB sources
 ├── Dockerfile           python:3.12.7-slim-bookworm, pinned dependencies
 ├── requirements.txt     runtime dependencies incl. pinned transitive packages
 └── requirements-dev.txt test-only dependencies
@@ -80,9 +81,9 @@ A date range across a month boundary therefore uses both sources.
 
 ### 4. Download and store
 
-- **Permalink:** the CSV is streamed directly into object storage, without temp files.
+- **Permalink:** the CSV is streamed directly into the bucket, without temp files.
 - **Archive:** the ZIP is downloaded once per month into a scratch volume
-  (`/tmp/fetcher`). Only the requested days (`YYYY-MM-DD_istdaten.csv` at the ZIP root)
+  (`/tmp/fetcher`). Only the requested days (`YYYY-MM-DD_IstDaten.csv` at the ZIP root)
   are extracted and uploaded. The scratch directory is removed afterwards, on success
   and on failure. If all days of a month are skipped, the ZIP is not downloaded.
 
@@ -124,12 +125,9 @@ Nothing is hardcoded.
 
 | Variable | Purpose |
 |---|---|
-| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | storage credentials, used by the storage service and the fetcher |
-| `S3_ENDPOINT_URL` | storage endpoint; empty = AWS S3 |
-| `S3_BUCKET`, `S3_REGION` | bucket (default `sbb-ist-daten`) and region |
-| `S3_CREATE_BUCKET` | let the fetcher create a missing bucket; keep `false` locally (the storage service creates it) |
-| `S3_BUCKET_WAIT_SECONDS` | how long the fetcher waits for the bucket after storage starts |
-| `S3_API_PORT` | host port of the S3 API (127.0.0.1 only) |
+| `GCS_BUCKET` | data lake bucket (Terraform output `bucket_url` without `gs://`) |
+| `GCP_PROJECT_ID` | optional; empty = project of the service-account key |
+| `GCP_PIPELINE_KEY_FILE` | host path of the pipeline service account's JSON key; Compose mounts it read-only into the container and sets `GOOGLE_APPLICATION_CREDENTIALS` |
 | `PERMALINK_URL_TEMPLATE`, `ARCHIVE_URL_TEMPLATE` | source URLs |
 | `HTTP_TIMEOUT_SECONDS` | timeout per request |
 | `FETCHER_TIMEZONE` | defines "today" and "current month" |
@@ -147,8 +145,10 @@ python -m unittest discover -s tests -t . -v
 ```
 
 - `test_routing`: routing rules, incl. month boundaries and the first-of-month rule.
-- `test_e2e`: the real CLI against moto and mocked SBB sources: skip/overwrite,
-  failure isolation, temp cleanup, bucket handling, inventory, exit codes.
+- `test_e2e`: the real CLI against a local Cloud Storage emulator
+  (`gcp-storage-emulator`, in memory) and mocked SBB sources: skip/overwrite,
+  failure isolation, broken downloads, temp cleanup, bucket handling, inventory,
+  exit codes. The tests never touch the real bucket.
 
 ## Design decisions
 
@@ -243,23 +243,31 @@ random access, so it is downloaded into a scratch volume (`/tmp/fetcher`) first.
 The volume is anonymous and the directory is removed after every run, on success
 and on failure, so disk usage never accumulates across runs.
 
-### Object storage behind the S3 API
+### Cloud Storage as the data lake
 
-Raw files go to S3-compatible object storage, accessed only through the S3 API
-(boto3). Locally this is a SeaweedFS container. Later in the project the storage
-moves to a cloud provider (AWS S3): this only needs changes in `.env`
-(empty `S3_ENDPOINT_URL`, real credentials and region), not in the code.
+Raw files go straight to the Cloud Storage bucket; the production path stores
+nothing locally except the temporary archive ZIP (see above; agreed with the
+lecturer as "temporary processing"). Until Architecture v0.2 the bucket was a local
+S3-compatible container (SeaweedFS, accessed with boto3); the key contract
+`raw/YYYY-MM-DD_istdaten.csv` stayed the same when moving to the cloud.
 
-The bucket belongs to the storage service, not to the fetcher. Locally the storage
-service creates it and the fetcher only waits for it (`S3_BUCKET_WAIT_SECONDS`).
-`S3_CREATE_BUCKET=true` exists for cloud setups where the bucket is not provisioned
-in advance.
+- **Client:** the official `google-cloud-storage` library, not the S3-compatible
+  XML API: it authenticates with the service-account key like Kestra and Terraform
+  do, and needs no extra HMAC secret.
+- **Uploads** are resumable, in 16 MiB chunks: a 650 MB file never sits in memory,
+  and transient errors are retried per chunk. If the download breaks half-way, the
+  upload is cancelled and the object is not created or replaced.
+- **The bucket belongs to Terraform.** The fetcher never creates it; a missing or
+  inaccessible bucket is a configuration error (exit code 2) before any download.
+- **Least privilege:** the fetcher runs with the pipeline service account
+  (Storage Object User, Storage Bucket Viewer), which can write objects but cannot
+  create or delete buckets.
 
 ### A job, not a service
 
 The fetcher runs, processes the requested days and exits (Compose profile `jobs`,
 always with `--rm`). It keeps no state of its own: everything it needs to know is
-in the arguments and in object storage. This matches the batch nature of the data
+in the arguments and in the bucket. This matches the batch nature of the data
 (one file per day) and lets Kestra start it like any other command.
 
 ### Reproducibility
@@ -270,11 +278,11 @@ Another team should end up with the same raw files. Therefore:
 - all Python packages are pinned, including transitive ones, and installed with
   `--no-deps` followed by `pip check`;
 - all configuration comes from `.env`;
-- `python -m app.inventory` lists every stored file with size and ETag, so two teams
+- `python -m app.inventory` lists every stored file with size and MD5, so two teams
   can compare their results directly.
 
 The upstream data is outside our control: a day can only be fetched while it is
-published. The object storage is the reproducible snapshot.
+published. The bucket is the reproducible snapshot.
 
 ### `FETCHER_REFERENCE_DATE`
 
