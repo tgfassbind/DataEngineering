@@ -10,6 +10,9 @@ from pathlib import Path
 import yaml
 
 RAW_KEY_TEMPLATE = "raw/{day}_istdaten.csv"
+# Output of the transform, loaded into BigQuery by Kestra (see bigquery/sql/).
+STOP_EVENTS_KEY_TEMPLATE = "processed/{day}_stop_events.parquet"
+RUN_SCOPE_KEY_TEMPLATE = "processed/{day}_run_scope.parquet"
 DEFAULT_LINES_FILE = Path(__file__).resolve().parent.parent / "config" / "lines.yml"
 
 DEFAULT_MAX_ABS_DELAY_S = 10_800 # 3 h
@@ -26,6 +29,16 @@ def raw_key(day: date) -> str:
     return RAW_KEY_TEMPLATE.format(day=day.isoformat())
 
 
+def stop_events_key(day: date) -> str:
+    """processed/2026-09-21_stop_events.parquet: validated rows of one day."""
+    return STOP_EVENTS_KEY_TEMPLATE.format(day=day.isoformat())
+
+
+def run_scope_key(day: date) -> str:
+    """processed/2026-09-21_run_scope.parquet: the (day, line) pairs processed."""
+    return RUN_SCOPE_KEY_TEMPLATE.format(day=day.isoformat())
+
+
 @dataclass(frozen=True, order=True)
 class Line:
     """One selected line. LINIEN_TEXT alone is not unique (several S-Bahn
@@ -36,7 +49,8 @@ class Line:
 
     @property
     def scope(self) -> tuple[str, str]:
-        """What staging rows are tagged with (and retransform deletes by). """
+        """The line as stored (dim_line natural key). A rerun replaces the
+        day's rows of exactly these scopes in BigQuery."""
         return (self.linien_text, self.betreiber_abk)
 
     def __str__(self) -> str:
@@ -151,18 +165,10 @@ class Limits:
 @dataclass(frozen=True)
 class Config:
     """All settings of one transform run, read once at startup."""
-    s3_endpoint_url: str | None # empty -> real AWS S3
-    s3_access_key_id: str
-    s3_secret_access_key: str
-    s3_region: str
-    s3_bucket: str
-    s3_bucket_wait_s: int # how long to wait for the bucket to appear
-    # PostgreSQL
-    pg_host: str
-    pg_port: int
-    pg_db: str
-    pg_user: str
-    pg_password: str
+    # Data lake (Cloud Storage). Credentials are not configured here: the
+    # Google client reads GOOGLE_APPLICATION_CREDENTIALS itself.
+    gcs_bucket: str
+    gcp_project: str | None  # empty -> taken from the service-account key
     # Processing
     chunk_size: int
     limits: Limits
@@ -170,17 +176,8 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
-            s3_endpoint_url=_env("S3_ENDPOINT_URL"),
-            s3_access_key_id=_env("S3_ACCESS_KEY_ID", required=True),
-            s3_secret_access_key=_env("S3_SECRET_ACCESS_KEY", required=True),
-            s3_region=_env("S3_REGION", "us-east-1"),
-            s3_bucket=_env("S3_BUCKET", required=True),
-            s3_bucket_wait_s=_env_int("S3_BUCKET_WAIT_SECONDS", 60, minimum=0),
-            pg_host=_env("POSTGRES_HOST", "database"),
-            pg_port=_env_int("POSTGRES_PORT", 5432),
-            pg_db=_env("POSTGRES_DB", "deng"),
-            pg_user=_env("POSTGRES_USER", required=True),
-            pg_password=_env("POSTGRES_PASSWORD", required=True),
+            gcs_bucket=_env("GCS_BUCKET", required=True),
+            gcp_project=_env("GCP_PROJECT_ID"),
             chunk_size=_env_int("TRANSFORM_CHUNK_SIZE", DEFAULT_CHUNK_SIZE),
             limits=Limits(
                 max_abs_delay_s=_env_int("TRANSFORM_MAX_ABS_DELAY_S", DEFAULT_MAX_ABS_DELAY_S),
@@ -188,9 +185,3 @@ class Config:
                                                 DEFAULT_MAX_SEGMENT_DURATION_S),
             ),
         )
-
-    def pg_conninfo(self) -> dict:
-        """Keyword arguments for psycopg.connect (password never logged)."""
-        return dict(host=self.pg_host, port=self.pg_port, dbname=self.pg_db,
-                    user=self.pg_user, password=self.pg_password,
-                    application_name="deng-transform")

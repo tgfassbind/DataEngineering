@@ -1,24 +1,19 @@
-"""Compute the staging rows: signed delays and the row hash that drives the upsert."""
+"""Compute the output rows: one row per served stop with signed delays."""
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import date
 
 import pandas as pd
 
-# Column order of staging.stop_events without row_hash and loaded_at.
-# The row hash is computed over exactly these values, in this order.
-VALUE_COLUMNS = [
+# Columns of the output file processed/<day>_stop_events.parquet, in order.
+# Same as the BigQuery load table core.stg_stop_event.
+OUTPUT_COLUMNS = [
     "betriebstag", "fahrt_bezeichner", "bpuic", "haltestellen_name",
-    "linien_text", "betreiber_abk", "stop_sequence", "sched_arr", "sched_dep",
+    "linien_text", "betreiber_abk", "betreiber_name", "verkehrsmittel_text", "produkt_id",
+    "stop_sequence", "sched_arr", "sched_dep",
     "arr_delay_s", "dep_delay_s", "is_additional_trip",
 ]
-STAGING_COLUMNS = VALUE_COLUMNS + ["row_hash"]
-# Line attributes for the dimension dim_line in BigQuery. Carried in the output
-# frame only: not stored in PostgreSQL staging and not part of row_hash, so
-# existing staging rows keep their hash.
-LINE_ATTRIBUTE_COLUMNS = ["betreiber_name", "verkehrsmittel_text", "produkt_id"]
+
 
 def delay_seconds(actual: pd.Series, planned: pd.Series, valid: pd.Series) -> pd.Series:
     """actual - planned in whole seconds; <NA> where the timestamp is not valid."""
@@ -27,7 +22,11 @@ def delay_seconds(actual: pd.Series, planned: pd.Series, valid: pd.Series) -> pd
 
 
 def build_rows(validated: pd.DataFrame, day: date) -> pd.DataFrame:
-    """One output row per served stop, staging column names and types."""
+    """One output row per served stop, output column names and types.
+
+    sched_arr / sched_dep stay pandas timestamps (naive, Swiss local time);
+    output.py writes them as text, see there.
+    """
     v = validated
     out = pd.DataFrame({
         "betriebstag": [day] * len(v),
@@ -47,46 +46,4 @@ def build_rows(validated: pd.DataFrame, day: date) -> pd.DataFrame:
         "is_additional_trip": v["ZUSATZFAHRT_TF"].str.strip().str.lower() == "true",
     }).reset_index(drop=True)
     out["betriebstag"] = out["betriebstag"].astype(object)
-    records = to_records(out)
-    out["row_hash"] = pd.Series([row_hash(r) for r in records], dtype=object)
-    return out
-
-
-def to_records(frame: pd.DataFrame) -> list[tuple]:
-    """Plain Python values per row (NaT/<NA> -> None) in VALUE_COLUMNS order:
-    the exact values that are hashed and written to PostgreSQL."""
-    cols = []
-    for name in VALUE_COLUMNS:
-        s = frame[name]
-        if name in ("sched_arr", "sched_dep"):
-            cols.append([None if pd.isna(x) else x.to_pydatetime() for x in s])
-        elif name in ("bpuic", "stop_sequence", "arr_delay_s", "dep_delay_s"):
-            cols.append([None if pd.isna(x) else int(x) for x in s])
-        elif name == "is_additional_trip":
-            cols.append([bool(x) for x in s])
-        else:
-            cols.append([None if x is None or (not isinstance(x, (str, date)) and pd.isna(x))
-                         else x for x in s])
-    return list(zip(*cols))
-
-
-def _canonical(value) -> object:
-    """JSON-safe canonical form: dates/times ISO 8601, NULL -> null."""
-    if value is None:
-        return None
-    if isinstance(value, (date,)):
-        return value.isoformat()
-    return value
-
-
-def row_hash(record: tuple) -> str:
-    """SHA-256 over the canonical string of all stored value columns.
-
-    The canonical string is a compact JSON array of the values in
-    VALUE_COLUMNS order (strings verbatim, integers as integers, booleans as
-    true/false, timestamps ISO 8601 'YYYY-MM-DDTHH:MM:SS', NULL as null).
-    JSON quoting makes it unambiguous whatever characters the texts contain.
-    """
-    canonical = json.dumps([_canonical(v) for v in record],
-                           ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return out[OUTPUT_COLUMNS]

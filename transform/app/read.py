@@ -1,7 +1,7 @@
-"""Read one day's raw CSV from object storage, chunk by chunk, and keep only
+"""Read one day's raw CSV from the data lake, chunk by chunk, and keep only
 the configured lines.
 
-Memory stays bounded: the S3 object is streamed (boto3 StreamingBody) straight
+Memory stays bounded: the Cloud Storage object is streamed in ranges straight
 into pandas.read_csv(chunksize=...). Nothing is written to disk and at no point
 is the whole file in memory: only one chunk of raw rows plus the (small)
 already-filtered rows of the selected lines.
@@ -11,17 +11,14 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import time
 import warnings
 from dataclasses import dataclass
 from datetime import date
 
-import boto3
 import pandas as pd
-from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError, EndpointConnectionError
 
-from .config import Config, Line, raw_key
+from .config import Line, raw_key
+from .storage import ObjectStore
 
 log = logging.getLogger(__name__)
 
@@ -39,10 +36,6 @@ MAX_HEADER_BYTES = 64 * 1024
 STREAM_BLOCK = 1024 * 1024
 
 
-class RawFileMissing(Exception):
-    """raw/<date>_istdaten.csv does not exist: the day was not fetched yet."""
-
-
 class RawFileInvalid(Exception):
     """The object exists but does not match the Ist-Daten format."""
 
@@ -57,48 +50,10 @@ class ReadResult:
     trips_excluded_by_via: int = 0
 
 
-def make_s3_client(cfg: Config):
-    """Same client settings as the fetcher (path-style works locally and on AWS)."""
-    return boto3.client(
-        "s3",
-        endpoint_url=cfg.s3_endpoint_url,
-        aws_access_key_id=cfg.s3_access_key_id,
-        aws_secret_access_key=cfg.s3_secret_access_key,
-        region_name=cfg.s3_region,
-        config=BotoConfig(s3={"addressing_style": "path"},
-                          retries={"max_attempts": 5, "mode": "standard"}),
-    )
-
-
-class BucketUnavailable(Exception):
-    """Storage not reachable or bucket missing after waiting."""
-
-
-def wait_for_bucket(s3, bucket: str, wait_s: int) -> None:
-    """Wait until the bucket exists. The storage service reports healthy
-    before it has created S3_BUCKET, so the very first job on a fresh clone
-    may arrive a moment too early (same behaviour as the fetcher)."""
-    deadline = time.monotonic() + wait_s
-    while True:
-        try:
-            s3.head_bucket(Bucket=bucket)
-            return
-        except (ClientError, EndpointConnectionError) as e:
-            code = (e.response.get("Error", {}).get("Code", "")
-                    if isinstance(e, ClientError) else "unreachable")
-            if code not in {"404", "NoSuchBucket", "NotFound", "unreachable"}:
-                raise BucketUnavailable(f"bucket '{bucket}': {e}") from None
-            if time.monotonic() > deadline:
-                raise BucketUnavailable(
-                    f"bucket '{bucket}' not available after {wait_s}s ({code})") from None
-            log.info("Bucket '%s' not available yet (%s), waiting ...", bucket, code)
-            time.sleep(2)
-
-
 class _PrefixedStream(io.RawIOBase):
     """Read-only stream: already-consumed bytes (the header) followed by the
     rest of the underlying stream. Lets us inspect the header line without
-    seeking (an S3 stream cannot seek)."""
+    seeking back."""
 
     def __init__(self, prefix: bytes, rest):
         self._buf = prefix
@@ -158,7 +113,7 @@ def detect_separator(header: str) -> str:
 
 
 def filter_chunks(binary_stream, lines: list[Line], chunk_size: int) -> ReadResult:
-    """Core of the reader, independent of S3 (tests feed a local file)."""
+    """Core of the reader, independent of storage (tests feed a local file)."""
     head, header = _split_header(binary_stream)
     sep = detect_separator(header)
     stream = io.BufferedReader(_PrefixedStream(head, binary_stream), STREAM_BLOCK)
@@ -222,24 +177,16 @@ def apply_via_filter(frame: pd.DataFrame, lines: list[Line]) -> tuple[pd.DataFra
     excluded = trip[~keep].nunique()
     return frame.loc[keep].reset_index(drop=True), int(excluded)
 
-def read_day(s3, bucket: str, day: date, lines: list[Line], chunk_size: int) -> ReadResult:
-    """Stream raw/<day>_istdaten.csv from object storage and filter it."""
-    key = raw_key(day)
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") in {"404", "NoSuchKey", "NotFound"}:
-            raise RawFileMissing(
-                f"s3://{bucket}/{key} not found - fetch the day first "
-                f"(docker compose run --rm fetcher --date {day.isoformat()})") from None
-        raise
-    body = obj["Body"]
+def read_day(store: ObjectStore, day: date, lines: list[Line], chunk_size: int) -> ReadResult:
+    """Stream raw/<day>_istdaten.csv from the data lake and filter it.
+    Raises storage.RawFileMissing if the day was not fetched."""
+    body, size = store.open_raw(day)
     try:
         result = filter_chunks(body, lines, chunk_size)
     finally:
         body.close()
-    result.object_bytes = int(obj.get("ContentLength", -1))
-    _check_operating_day(result.frame, day, key)
+    result.object_bytes = size
+    _check_operating_day(result.frame, day, raw_key(day))
     return result
 
 

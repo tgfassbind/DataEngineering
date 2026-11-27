@@ -1,4 +1,4 @@
-"""Development / test helper: put a raw file into object storage without the fetcher.
+"""Development / test helper: put a raw file into the data lake without the fetcher.
 
 Two modes (both write raw/<date>_istdaten.csv, the fetcher's storage contract):
 
@@ -19,14 +19,15 @@ import argparse
 import io
 import logging
 import random
+import shutil
 import sys
 from datetime import date, datetime, timedelta
 from typing import Iterator
 
-from botocore.exceptions import ClientError
+from google.auth.exceptions import DefaultCredentialsError
 
 from .config import Config, ConfigError, raw_key
-from .read import BucketUnavailable, make_s3_client, wait_for_bucket
+from .storage import ObjectStore
 
 log = logging.getLogger("seed")
 
@@ -106,36 +107,29 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     try:
         cfg = Config.from_env()
-    except ConfigError as e:
+        store = ObjectStore(cfg)
+        store.check_bucket()
+    except (ConfigError, DefaultCredentialsError) as e:
         log.error("Configuration error: %s", e)
         return 2
-    s3 = make_s3_client(cfg)
-    try:
-        wait_for_bucket(s3, cfg.s3_bucket, cfg.s3_bucket_wait_s)
-    except BucketUnavailable as e:
-        log.error("Object storage: %s", e)
-        return 2
     key = raw_key(args.date)
-    try:
-        s3.head_object(Bucket=cfg.s3_bucket, Key=key)
-        if not args.force:
-            log.error("s3://%s/%s already exists; use --force to overwrite", cfg.s3_bucket, key)
-            return 1
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") not in {"404", "NoSuchKey", "NotFound"}:
-            raise
+    blob = store.bucket.blob(key)
+    if blob.exists() and not args.force:
+        log.error("gs://%s/%s already exists; use --force to overwrite", cfg.gcs_bucket, key)
+        return 1
     if args.file:
         with open(args.file, "rb") as f:
-            s3.upload_fileobj(f, cfg.s3_bucket, key, ExtraArgs={"ContentType": "text/csv"})
-        log.info("uploaded %s -> s3://%s/%s", args.file, cfg.s3_bucket, key)
+            blob.upload_from_file(f, content_type="text/csv")
+        log.info("uploaded %s -> gs://%s/%s", args.file, cfg.gcs_bucket, key)
     else:
         stream = _IterStream(synthetic_lines(args.synthetic, args.date))
-        s3.upload_fileobj(io.BufferedReader(stream, 1024 * 1024), cfg.s3_bucket, key,
-                          ExtraArgs={"ContentType": "text/csv"})
+        # resumable upload in 16 MiB pieces: the file is never fully in memory
+        with blob.open("wb", chunk_size=16 * 1024 * 1024, content_type="text/csv") as out:
+            shutil.copyfileobj(io.BufferedReader(stream, 1024 * 1024), out, 1024 * 1024)
         target = sum(1 for t in range(0, -(-args.synthetic // STOPS_PER_TRIP))
                      if t % TARGET_EVERY == 0)
-        log.info("generated %d rows (%d bytes, ~%d IR75/SBB trips) -> s3://%s/%s",
-                 args.synthetic, stream.bytes, target, cfg.s3_bucket, key)
+        log.info("generated %d rows (%d bytes, ~%d IR75/SBB trips) -> gs://%s/%s",
+                 args.synthetic, stream.bytes, target, cfg.gcs_bucket, key)
     return 0
 
 
