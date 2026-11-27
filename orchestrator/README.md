@@ -1,16 +1,25 @@
 # Orchestrator
 
-Kestra runs the pipeline: fetch → transform → aggregation, every morning for the
-previous day and on demand for any date range. It does not process data itself; it
-starts the fetcher and transform jobs and calls the aggregation procedure.
+Kestra runs the pipeline: fetch → transform → load into BigQuery → refresh the data
+mart, every morning for the previous day and on demand for any date range. Kestra
+runs locally in Docker; the data lives in Google Cloud. It starts the fetcher and
+transform jobs on the host and runs the BigQuery steps itself with the GCP plugin.
+
+```
+fetch (job)        source ──► gs://…/raw/
+transform (job)    raw/ ──► gs://…/processed/  (Parquet)
+load_days (Kestra) processed/ ──► core.stg_* ──► 10_load_core.sql ──► core (star schema)
+refresh_mart       20_refresh_mart.sql ──► mart.mart_od_delay_by_slot
+```
 
 ## Folder structure
 
 ```
 orchestrator/
 ├── flows/
-│   ├── backfill.yml     flow deng.backfill: the pipeline for a date range
-│   └── daily.yml        flow deng.daily: schedule, computes yesterday, calls backfill
+│   ├── backfill.yml        flow deng.backfill: the pipeline for a date range
+│   ├── daily.yml           flow deng.daily: schedule, computes yesterday, calls backfill
+│   └── setup_bigquery.yml  flow deng.setup_bigquery: creates the tables once
 └── kestra/
     └── application.yml  Kestra server configuration (no secrets; values come from .env)
 ```
@@ -29,22 +38,30 @@ the next start. Deleting a file does not delete the flow in Kestra; delete it in
 Both start with `docker compose up -d`. On the first start Kestra needs 1–2 minutes
 until it is healthy.
 
+Mounted into `kestra` (read-only): the flows, `bigquery/sql/` (the SQL the flows run,
+at `/app/deng/sql`) and the pipeline service account's key
+(`GOOGLE_APPLICATION_CREDENTIALS`).
+
 ## Usage
 
 Open <http://localhost:8080> and log in with `KESTRA_BASIC_AUTH_USERNAME` /
-`KESTRA_BASIC_AUTH_PASSWORD`. Both flows are under **Flows → namespace `deng`**.
+`KESTRA_BASIC_AUTH_PASSWORD`. The flows are under **Flows → namespace `deng`**.
 
+- **`setup_bigquery`** is run once by hand after `terraform apply`: it creates the
+  tables (`01_tables.sql`) and fills the calendar dimensions (`02_seed_calendar.sql`).
+  Safe to rerun.
 - **`daily`** runs on its own every day at 06:15 Europe/Zurich.
 - **`backfill`** is started by hand with these inputs:
 
 | Input | Values | Effect |
 |---|---|---|
 | `start_date`, `end_date` | dates, inclusive | range of operating days; not in the future |
-| `mode` | `full` (default) | fetch → transform (upsert) → aggregation |
-| | `fetch_only` | fetch only; staging and reporting untouched |
-| | `transform_only` | transform with `--retransform` → aggregation; raw files untouched |
-| `force_overwrite` | `true` / `false` (default) | re-download days already stored; ignored in `transform_only` |
-| `lines` | e.g. `IR75:SBB,S1:SBB@8502202` (optional) | overrides `transform/config/lines.yml` for this run |
+| `mode` | `full` (default) | fetch → transform → load → refresh mart |
+| | `fetch_only` | fetch only; BigQuery untouched |
+| | `transform_only` | transform → load → refresh mart; raw files untouched |
+| | `load_only` | load the existing files in `processed/` → refresh mart; nothing recomputed |
+| `force_overwrite` | `true` / `false` (default) | re-download days already stored; only in `full` and `fetch_only` |
+| `lines` | e.g. `IR75:SBB,S1:SBB@8502202` (optional) | overrides `transform/config/lines.yml` for this run; only in `full` and `transform_only` |
 
 ## How a run works
 
@@ -71,14 +88,26 @@ whole date range. Depending on the fetcher's exit code:
 - 2 (invalid configuration): stop immediately, no retry.
 
 **3. Transform** (`full`, `transform_only`). Runs `docker compose run --rm transform`
-with the same range, plus `--retransform` in `transform_only` and `--lines` if given.
-Any failure stops the flow, so the aggregation does not run on incomplete data.
+with the same range, plus `--lines` if given. It writes
+`processed/<day>_stop_events.parquet` and `processed/<day>_run_scope.parquet`.
+Any failure stops the flow, so nothing is loaded from an incomplete run.
 
-**4. Aggregation** (`full`, `transform_only`). Calls
-`reporting.refresh_od_delay()` directly over JDBC. Retried up to 3 times.
+**4. Load** (all modes except `fetch_only`). The task `days` lists the operating days
+of the range; the loop `load_days` then handles one day after the other:
 
-**5. Summary.** Logs the staging rows and trips in the range and the size of the
-reporting table.
+1. `load_stop_events`, `load_run_scope`: `LoadFromGcs` of the two Parquet files into
+   `core.stg_stop_event` and `core.stg_run_scope` (`WRITE_TRUNCATE`);
+2. `load_core`: `bigquery/sql/10_load_core.sql` merges the dimensions and replaces
+   the day's processed lines in `core.fact_stop_event`, in one transaction.
+
+Days run strictly one after the other (`concurrencyLimit: 1`), because the load
+tables are shared. Each task is retried up to 3 times (temporary BigQuery errors);
+all three are safe to repeat.
+
+**5. Data mart.** `refresh_mart` runs `bigquery/sql/20_refresh_mart.sql` once after
+the loop: `mart.mart_od_delay_by_slot` is recomputed in full. Retried up to 3 times.
+
+**6. Summary.** Logs the fact rows and trips in the range and the size of the mart.
 
 ### How Kestra starts the jobs
 
@@ -102,9 +131,8 @@ Kestra log view.
 | `KESTRA_UI_PORT` | host port of the UI (127.0.0.1 only) |
 | `KESTRA_DB_USER`, `KESTRA_DB_PASSWORD`, `KESTRA_DB_NAME` | Kestra's metadata database |
 | `DOCKER_SOCKET` | host path of the Docker socket (rootless Docker: e.g. `/run/user/1000/docker.sock`) |
-
-The `POSTGRES_*` values of the pipeline database are passed to Kestra for the
-aggregation step.
+| `GCS_BUCKET`, `GCP_PROJECT_ID`, `GCP_LOCATION` | bucket, project and location of the BigQuery steps (`envs.gcs_bucket`, `envs.gcp_project_id`, `envs.gcp_location`) |
+| `GCP_PIPELINE_KEY_FILE` | host path of the pipeline service account's JSON key, mounted read-only |
 
 After changing any of these in `.env`, recreate the container:
 
@@ -121,6 +149,10 @@ docker compose up -d --force-recreate kestra
 | "HOST_PROJECT_DIR … is not the repo on the host" | wrong path in `.env`, then recreate `kestra` |
 | "Unable to find `host_project_dir`" | `kestra` was not recreated after changing `.env` |
 | flow missing or outdated in the UI | invalid flow file: `docker compose logs kestra \| grep -i "unable to create flow"` |
+| "Only files inside the working directory are allowed" | `bigquery/sql` not mounted or `local-files.allowed-paths` missing in `kestra/application.yml`; recreate `kestra` |
+| `load_stop_events`: "Not found: URI gs://…" | the day was not transformed: run `transform_only` (or `full`) for it |
+| `load_core`: "Table … stg_… was not found" / dimension or fact table missing | run `setup_bigquery` once |
+| "Permission denied" / 403 in a BigQuery task | pipeline service account lacks BigQuery Job User or BigQuery Data Editor |
 
 ## Design decisions
 
@@ -131,11 +163,32 @@ backfills over date ranges, retries and a history of what ran would all have had
 be built by hand. Kestra, introduced in class, provides exactly that, with flows
 that are declared in YAML and versioned with the rest of the project.
 
-### Separate database for Kestra
+### Kestra local, data in the cloud
 
-Kestra's metadata (flows, executions, logs) lives in its own PostgreSQL, not in the
-pipeline database. A change to or failure of one system does not affect the other:
-resetting the pipeline database keeps the Kestra history, and the other way round.
+Kestra runs locally in Docker, as in class; only the data lives in Google Cloud.
+The pipeline needs no Kestra server in the cloud: it reaches Cloud Storage and
+BigQuery through the APIs, with the pipeline service account. The same key is
+mounted into the jobs and into Kestra, so all steps act as the same identity with
+the same, limited rights (objects and tables, no buckets or datasets).
+
+Kestra keeps its own metadata (flows, executions, logs) in its own PostgreSQL
+(`kestra-db`). It is not part of the data pipeline.
+
+### Loading as Kestra tasks, SQL from the repo
+
+Fetch and transform are our own containers; loading and modelling are BigQuery
+jobs. They run as Kestra GCP tasks (`LoadFromGcs`, `Query`), as in class, so every
+step is visible on its own in the execution: rows loaded per file, the result of
+the load script, the mart refresh. The SQL itself stays in `bigquery/sql/` and is
+read at run time (`read('file:///app/deng/sql/…')`), so there is one copy of each
+statement and it is versioned with the code.
+
+### One day at a time
+
+The loop loads day by day instead of all files at once. A failed day is visible as
+such, the load tables always hold exactly one day, and `10_load_core.sql` replaces
+exactly that day. The mart is refreshed once at the end, not per day, because it is
+recomputed in full anyway.
 
 ### `daily` calls `backfill`
 
@@ -170,13 +223,15 @@ deviations from the original that nobody remembers making.
   task ends successfully on exit code 2 so that Kestra does not retry it, and the next
   task fails the flow with a clear message.
 - **Transform** is not retried: its failures are deterministic and would repeat.
-- **Aggregation** gets a few short retries, e.g. if another refresh still holds the lock.
+- **BigQuery tasks** get a few short retries for temporary API errors. Every one of
+  them can be repeated without harm: the loads replace the load tables, the SQL
+  scripts are idempotent and run in a transaction.
 
 ### One execution at a time
 
-`daily` and manual backfills queue up instead of running in parallel. The jobs
-themselves have guardrails against concurrent runs (locks in the transform and the
-aggregation), but a serial order is easier to follow: better safe than sorry.
+`daily` and manual backfills queue up instead of running in parallel. This is
+required, not only convenient: all runs share the load tables `core.stg_*`, and two
+runs loading at the same time would overwrite each other's day.
 
 ### Checks before the first step
 
@@ -186,6 +241,6 @@ a cryptic Docker error.
 
 ### Schedule
 
-`daily` runs at 06:15 Europe/Zurich for the previous day, so the reporting is up to
+`daily` runs at 06:15 Europe/Zurich for the previous day, so the data mart is up to
 date before students check it. This is an initial value and can be changed in
 `flows/daily.yml`.
