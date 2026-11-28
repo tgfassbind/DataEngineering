@@ -277,6 +277,36 @@ tasks:
       interval: PT1M
       maxAttempts: 3
 
+  # ---------------------------------------------------------------- data quality (monitoring)
+  # Blocking checks run inside load_core and refresh_mart (a failure stops the
+  # flow and changes nothing). These checks only report: findings are stored in
+  # core.dq_check_result and logged as warnings below; the run stays successful.
+  - id: quality_checks
+    type: io.kestra.plugin.gcp.bigquery.Query
+    runIf: "{{ inputs.mode != 'fetch_only' }}"
+    projectId: "{{ envs.gcp_project_id }}"
+    location: "{{ envs.gcp_location }}"
+    sql: |
+      DECLARE p_range_start DATE DEFAULT DATE '{{ inputs.start_date | date('yyyy-MM-dd') }}';
+      DECLARE p_range_end DATE DEFAULT DATE '{{ inputs.end_date | date('yyyy-MM-dd') }}';
+      DECLARE p_run_id STRING DEFAULT '{{ execution.id }}';
+      {{ read('file:///app/deng/sql/30_check_quality.sql') }}
+    fetchType: FETCH
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+
+  - id: log_quality_warnings
+    type: io.kestra.plugin.core.log.Log
+    runIf: "{{ inputs.mode != 'fetch_only' and (outputs.quality_checks.size ?? 0) > 0 }}"
+    level: WARN
+    message: |
+      {{ outputs.quality_checks.size }} data-quality warning(s), see core.dq_check_result (run_id {{ execution.id }}):
+      {% for r in outputs.quality_checks.rows %}
+      - {{ r.check_name }} {{ r.betriebstag ?? '' }} {{ r.linien_text ?? '' }}: {{ r.details }}
+      {% endfor %}
+
   # Read-only summary for the UI
   - id: summary
     type: io.kestra.plugin.gcp.bigquery.Query
@@ -299,4 +329,5 @@ tasks:
       Run OK ({{ inputs.mode }}, {{ inputs.start_date | date('yyyy-MM-dd') }}..{{ inputs.end_date | date('yyyy-MM-dd') }}):
       fact rows in range={{ outputs.summary.row.fact_rows_in_range }},
       trips in range={{ outputs.summary.row.trips_in_range }},
-      mart.mart_od_delay_by_slot rows={{ outputs.summary.row.mart_rows }}
+      mart.mart_od_delay_by_slot rows={{ outputs.summary.row.mart_rows }},
+      data-quality warnings={{ outputs.quality_checks.size ?? 0 }}
