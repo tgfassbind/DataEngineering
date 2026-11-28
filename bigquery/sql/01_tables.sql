@@ -107,6 +107,25 @@ CLUSTER BY line_key, stop_key
 OPTIONS (description = 'Grain: one served stop of one trip on one operating day.');
 
 -- ---------------------------------------------------------------------------
+-- Data-quality results (monitoring checks of 30_check_quality.sql)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS core.dq_check_result (
+  checked_at   TIMESTAMP  NOT NULL OPTIONS (description = 'Time of the check run.'),
+  run_id       STRING              OPTIONS (description = 'Kestra execution id, or manual.'),
+  range_start  DATE       NOT NULL OPTIONS (description = 'First operating day of the pipeline run.'),
+  range_end    DATE       NOT NULL OPTIONS (description = 'Last operating day of the pipeline run.'),
+  check_name   STRING     NOT NULL,
+  status       STRING     NOT NULL OPTIONS (description = 'PASS (no finding) or WARN (one row per finding).'),
+  betriebstag  DATE                OPTIONS (description = 'Operating day of the finding.'),
+  line_key     INT64               OPTIONS (description = 'Line of the finding (dim_line).'),
+  observed     FLOAT64             OPTIONS (description = 'Observed value, e.g. row count or share.'),
+  expected     STRING              OPTIONS (description = 'Threshold or expected value.'),
+  details      STRING              OPTIONS (description = 'Readable explanation.')
+)
+PARTITION BY DATE(checked_at)
+OPTIONS (description = 'History of the monitoring data-quality checks: one PASS row per check without findings, one WARN row per finding.');
+
+-- ---------------------------------------------------------------------------
 -- Data mart
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS mart.mart_od_delay_by_slot (

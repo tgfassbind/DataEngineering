@@ -12,6 +12,12 @@
 --
 -- DELETE + INSERT in one transaction: readers see the old content until the
 -- commit, and on any error the old content stays.
+--
+-- Blocking data-quality checks (docs/data_quality.md): before the commit, the
+-- new content is checked; a failed check rolls back and the previous mart
+-- stays published.
+
+DECLARE failed_checks ARRAY<STRING>;
 
 BEGIN
   BEGIN TRANSACTION;
@@ -74,6 +80,43 @@ BEGIN
   JOIN core.dim_line AS l ON l.line_key = agg.line_key
   JOIN core.dim_stop AS f ON f.stop_key = agg.from_stop_key
   JOIN core.dim_stop AS t ON t.stop_key = agg.to_stop_key;
+
+  SET failed_checks = ARRAY(
+    SELECT FORMAT('%s (%d)', check_name, failing)
+    FROM (
+      SELECT 'duplicate_mart_key' AS check_name, COUNT(*) AS failing
+      FROM (SELECT 1 FROM mart.mart_od_delay_by_slot
+            GROUP BY line_key, from_stop_key, to_stop_key, weekday, slot_hour
+            HAVING COUNT(*) > 1)
+      UNION ALL
+      -- a median exists exactly when there are measurements behind it
+      SELECT 'median_does_not_match_count', COUNTIF(
+          (median_dep_delay_min IS NULL) != (n_dep_obs = 0)
+          OR (median_arr_delay_min IS NULL) != (n_arr_obs = 0))
+      FROM mart.mart_od_delay_by_slot
+      UNION ALL
+      SELECT 'group_without_measurement', COUNTIF(n_dep_obs = 0 AND n_arr_obs = 0)
+      FROM mart.mart_od_delay_by_slot
+      UNION ALL
+      SELECT 'weekday_or_slot_out_of_range', COUNTIF(
+          weekday NOT BETWEEN 1 AND 7 OR slot_hour NOT BETWEEN 0 AND 23)
+      FROM mart.mart_od_delay_by_slot
+      UNION ALL
+      SELECT 'origin_equals_destination', COUNTIF(from_stop_key = to_stop_key)
+      FROM mart.mart_od_delay_by_slot
+      UNION ALL
+      -- facts with measurements, but an empty mart: the refresh lost everything
+      SELECT 'mart_empty', IF(
+          EXISTS (SELECT 1 FROM core.fact_stop_event WHERE dep_delay_s IS NOT NULL)
+          AND NOT EXISTS (SELECT 1 FROM mart.mart_od_delay_by_slot), 1, 0)
+    )
+    WHERE failing > 0
+    ORDER BY check_name
+  );
+  IF ARRAY_LENGTH(failed_checks) > 0 THEN
+    RAISE USING MESSAGE = FORMAT('failed checks on the new mart content: %s',
+                                 ARRAY_TO_STRING(failed_checks, ', '));
+  END IF;
 
   COMMIT TRANSACTION;
 EXCEPTION WHEN ERROR THEN
