@@ -16,8 +16,9 @@ those; this excerpt is only for tests.
 
 ## Use
 
-The verification in the [root README](../README.md#verification) uses this file:
-it is uploaded as the raw file for 2026-09-21, transformed and aggregated, and the
-result is compared with reference values.
+The tests of the transform (`transform/tests/`) use this file: the unit tests read
+it directly, the end-to-end tests upload it to a local Cloud Storage emulator as the
+raw file for 2026-09-21 and check the Parquet output against values computed from the
+file itself. See the [verification](../README.md#verification) in the root README.
 
 Source: [Open Transport Data Swiss](https://opentransportdata.swiss), Ist-Daten v2.
