@@ -1,6 +1,6 @@
 -- Recomputes mart.mart_od_delay_by_slot in full from the star schema.
--- Run after 10_load_core.sql. Same logic as the local procedure
--- reporting.refresh_od_delay() (db/init/03_refresh_procedure.sql):
+-- Run after 10_load_core.sql. Same logic as the former PostgreSQL procedure
+-- reporting.refresh_od_delay() of the local version (git tag v0.2-local):
 --
 --   * every ordered pair of stops (A before B) of the same trip on the same
 --     operating day, A must have a planned departure

@@ -2,9 +2,8 @@
 -- (dataset mart). The datasets themselves are created by Terraform.
 --
 -- Run once at setup, and again after a change (idempotent: CREATE ... IF NOT
--- EXISTS / CREATE OR REPLACE FUNCTION). Like the local db/init scripts,
--- IF NOT EXISTS does NOT change an existing table: schema changes need a
--- migration or dropping the table.
+-- EXISTS / CREATE OR REPLACE FUNCTION). IF NOT EXISTS does NOT change an
+-- existing table: schema changes need a migration or dropping the table.
 --
 -- BigQuery does not enforce PRIMARY KEY / FOREIGN KEY. They are declared
 -- (NOT ENFORCED) to document the model and help the query optimiser; the

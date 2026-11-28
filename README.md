@@ -155,7 +155,8 @@ Kestra or you start them on demand.
 
 Open <http://localhost:8080>, log in, go to **Flows → namespace `deng` →
 `setup_bigquery`** and execute it once. It creates the tables and fills the calendar
-dimensions; the last log line lists the tables of `core` and `mart`. Safe to rerun.
+dimensions; the last log line shows the number of tables in `core` and `mart` and the
+rows of `dim_date` (6574) and `dim_time_slot` (24). Safe to rerun.
 
 ### 7. Load data
 

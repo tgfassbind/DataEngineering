@@ -24,7 +24,7 @@ transform/
 │   ├── validate.py      timestamp parsing, stop order, validation rules
 │   ├── compute.py       arrival/departure delays, output columns
 │   ├── output.py        writes the two Parquet files per day to processed/
-│   └── seed.py          uploads a local CSV into raw/ (for the test fixture)
+│   └── seed.py          dev helper: uploads a local or synthetic CSV into raw/ (writes to the bucket)
 ├── config/
 │   └── lines.yml        versioned selection of lines
 ├── tests/               unit tests and end-to-end tests (against a GCS emulator)
@@ -168,17 +168,6 @@ timestamps, trips excluded by via stops and the written files, followed by a sum
 | `TRANSFORM_MEM_LIMIT` | hard memory limit of the container |
 
 `config/lines.yml` is mounted from the repo, so edits apply without a rebuild.
-
-## Test with the fixture
-
-`dataset/` contains an excerpt of one day (21.09.2026). Upload it to `raw/` and
-transform it, without fetching (this writes to the real bucket):
-
-```bash
-docker compose run --rm --entrypoint python transform \
-    -m app.seed --file dataset/excerpt_21092026_istdaten_v2.csv --date 2026-09-21
-docker compose run --rm transform --date 2026-09-21 --lines IR75:SBB,S1:SBB
-```
 
 ## Tests
 

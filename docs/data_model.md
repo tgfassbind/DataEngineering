@@ -17,7 +17,7 @@ GCS raw/*.csv ──► transform (Python) ──► GCS processed/<day>_stop_ev
                                                │
                                                ├──► core.dim_stop   (MERGE)
                                                ├──► core.dim_line   (MERGE)
-                                               └──► core.fact_stop_event (replace day partitions)
+                                               └──► core.fact_stop_event (replace processed days and lines)
 core.dim_date, core.dim_time_slot  (generated once)
 core.fact_stop_event + dims ──► mart.mart_od_delay_by_slot (full recompute, SQL)
 ```
@@ -112,7 +112,7 @@ days without data still exist.
 | Column | Type | Meaning |
 |---|---|---|
 | `slot_hour` | INT64 | key, 0–23 |
-| `label` | STRING | e.g. `07:00–07:59` |
+| `label` | STRING | e.g. `07:00-07:59` |
 
 ### `mart.mart_od_delay_by_slot`
 
@@ -296,9 +296,9 @@ approximate `APPROX_QUANTILES`.
 
 The SQL is in [`bigquery/sql/`](../bigquery/sql/). Data-quality checks of every
 step, incl. the results table `core.dq_check_result`: [data_quality.md](data_quality.md). The load into `core` and the mart
-refresh each run in one transaction; on an error nothing changes. BigQuery does not
-enforce primary keys, so the load checks the fact key of the load table first and
-stops without changes if it finds duplicates.
+refresh each run in one transaction and check the data before the commit (blocking
+data-quality checks, e.g. duplicate keys, referential integrity); on an error or a
+failed check nothing changes.
 
 ## Evolution from the local version (Architecture v0.1/v0.2)
 

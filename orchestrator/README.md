@@ -10,6 +10,7 @@ fetch (job)        source ──► gs://…/raw/
 transform (job)    raw/ ──► gs://…/processed/  (Parquet)
 load_days (Kestra) processed/ ──► core.stg_* ──► 10_load_core.sql ──► core (star schema)
 refresh_mart       20_refresh_mart.sql ──► mart.mart_od_delay_by_slot
+quality_checks     30_check_quality.sql ──► core.dq_check_result  (warnings only)
 ```
 
 ## Folder structure

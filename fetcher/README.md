@@ -105,7 +105,7 @@ What the transform job can rely on:
 One line per date and a summary:
 
 ```
-INFO app.fetch: date=2026-09-30 source=archive status=FETCHED 37200058 bytes from 2026-09-30_istdaten.csv -> raw/2026-09-30_istdaten.csv
+INFO app.fetch: date=2026-09-01 source=archive status=FETCHED 670052892 bytes from 2026-09-01_IstDaten.csv -> raw/2026-09-01_istdaten.csv
 INFO app.fetch: date=2026-10-01 source=permalink status=SKIPPED raw/2026-10-01_istdaten.csv already exists
 INFO fetcher: Summary: fetched=1, skipped=1, overwritten=0, failed=0
 ```
@@ -195,7 +195,7 @@ under a fixed key (`raw/YYYY-MM-DD_istdaten.csv`).
 This keeps both components independent. The fetcher only has to get the file
 right; the transform owns every decision about content (lines, validation, delays).
 A change to the transform logic never requires fetching again: the raw files are
-the source of truth and staging can always be rebuilt from them.
+the source of truth and the warehouse can always be rebuilt from them.
 
 ### No overwrite by default
 
@@ -204,8 +204,8 @@ it if so. Reruns and overlapping backfills are therefore safe and cheap, and a
 failed run can simply be repeated: finished days are skipped.
 
 We assume published raw data rarely changes. If it does, `--force-overwrite`
-replaces specific days on purpose, followed by a transform with `--retransform`
-(in Kestra: `fetch_only` with `force_overwrite`, then `transform_only`).
+replaces specific days on purpose; transform and load then replace the day in
+BigQuery (in Kestra: `backfill` with mode `full` and `force_overwrite: true`).
 Overwriting is never the default because it replaces the original record.
 
 It also saves requests: a skipped day never contacts the source.

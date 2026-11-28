@@ -15,7 +15,7 @@ description: |
   * Manual run (Execute button): yesterday relative to the execution start.
 
 labels:
-  project: travel-buddy
+  project: deng
 
 tasks:
   - id: yesterday
