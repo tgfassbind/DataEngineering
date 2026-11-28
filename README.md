@@ -18,7 +18,7 @@ Docker. Follow the setup below to run it in your own Google Cloud project.
 > processing logic, design decisions and the alternatives considered.
 > See the [component overview](#pipeline-overview) for the links.
 
-![Architecture](docs/Architecture_V02.svg)
+![Architecture v1.0](docs/Architecture_V10.svg)
 
 ## Team
 
