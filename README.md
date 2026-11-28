@@ -623,6 +623,91 @@ FROM (SELECT line_key, from_stop_key, to_stop_key, weekday, slot_hour
 If a check differs, the first layer that differs (raw → fact → dimensions → mart)
 shows where to look.
 
+## Teardown
+
+Removes everything this project created, locally and in Google Cloud. **This cannot
+be undone:** the raw files in the bucket are the only copy of the fetched data.
+
+### 1. Local containers and data
+
+```bash
+docker compose down -v --remove-orphans
+docker image rm deng-datapipeline/fetcher:1.0.0 deng-datapipeline/transform:1.0.0
+```
+
+The first command stops Kestra and deletes its database and execution history; the
+second removes the job images (optional). Same commands on Windows.
+
+### 2. Empty the bucket and the datasets
+
+`terraform destroy` refuses to delete a bucket or dataset that still contains data
+(see [terraform/README.md](terraform/README.md#removing-the-infrastructure)), so
+empty them first.
+
+- **Bucket:** Console → **Cloud Storage → Buckets** → your bucket → tick the box at
+  the top of the object list (selects `raw/` and `processed/`) → **Delete** →
+  confirm.
+- **BigQuery:** in BigQuery Studio (see step 8 of the setup) run, with **your
+  project ID** written out:
+
+  ```sql
+  DROP SCHEMA IF EXISTS `<project-id>`.mart CASCADE;
+  DROP SCHEMA IF EXISTS `<project-id>`.core CASCADE;
+  ```
+
+  This deletes both datasets with all their tables and functions. Write the project
+  ID out: without it, BigQuery uses the project selected at the top, which may be
+  another one. Check in the Explorer that `core` and `mart` are gone in the right
+  project; reload the page first, and close other open BigQuery windows, as they
+  can show an outdated state. If they are still there, `terraform destroy` fails with
+  `Dataset … is still in use, resourceInUse`.
+
+### 3. Remove the infrastructure
+
+macOS / Linux:
+
+```bash
+cd terraform
+export GOOGLE_APPLICATION_CREDENTIALS=$HOME/.config/deng/keys/<terraform-key-file>.json
+terraform destroy     # type "yes" when asked
+cd ..
+```
+
+Windows PowerShell:
+
+```powershell
+cd terraform
+$env:GOOGLE_APPLICATION_CREDENTIALS = "$HOME\.config\deng\keys\<terraform-key-file>.json"
+terraform destroy     # type "yes" when asked
+cd ..
+```
+
+Terraform deletes the bucket. The datasets are already gone; Terraform notices this
+and only removes them from its state. At the end: `Destroy complete!`
+
+### 4. Service accounts and keys
+
+- Console → **IAM & Admin → Service Accounts** → for `terraform` and `pipeline`:
+  **⋮ → Delete**. This also invalidates their keys.
+- Delete the local key files:
+
+  macOS / Linux:
+
+  ```bash
+  rm ~/.config/deng/keys/<terraform-key-file>.json ~/.config/deng/keys/<pipeline-key-file>.json
+  ```
+
+  Windows PowerShell:
+
+  ```powershell
+  rm $HOME\.config\deng\keys\<terraform-key-file>.json, $HOME\.config\deng\keys\<pipeline-key-file>.json
+  ```
+
+To check: **Cloud Storage → Buckets** no longer lists the bucket, and the BigQuery
+Explorer no longer shows `core` and `mart`. If the whole Google Cloud project was
+created only for this module, you can instead shut it down under **IAM & Admin →
+Settings → Shut down**; this removes everything in it.
+
 ## Known limitations
 
 **Data product**
