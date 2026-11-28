@@ -150,6 +150,92 @@ WHERE linien_text = 'S1' AND betreiber_abk = 'SBB'
 ORDER BY slot_hour;
 ```
 
+## How the model supports analysis
+
+The data mart answers the one question of the app, fast and from one small table.
+The star schema behind it answers further questions without new loads: the fact
+table keeps every served stop, the dimensions carry the attributes to filter and
+group by.
+
+| Question | Table(s) | Why there |
+|---|---|---|
+| How late is line X from A to B on weekday W at hour H? | `mart_od_delay_by_slot` | precomputed medians, one lookup |
+| Are S-Bahn and InterRegio equally punctual, on which weekdays? | fact + `dim_line` + `dim_date` | attributes of the line and the day |
+| Is the morning peak worse than the rest of the day? | fact + `dim_time_slot` + `dim_date` | grouping by hour of the planned time |
+| Between which stops does the delay build up? | fact (two consecutive stops) + `dim_stop` | needs the stop grain, not the OD aggregate |
+
+All queries on the fact table filter on `betriebstag`, so BigQuery reads only the
+partitions of the requested days.
+
+**Punctuality by means of transport and weekday.** "On time" follows the SBB
+definition: less than 3 minutes late.
+
+```sql
+SELECT l.verkehrsmittel_text,
+       d.weekday_name,
+       COUNT(f.arr_delay_s)                               AS arrivals_measured,
+       ROUND(AVG(f.arr_delay_s) / 60, 2)                  AS avg_arr_delay_min,
+       ROUND(100 * COUNTIF(f.arr_delay_s < 180)
+             / COUNT(f.arr_delay_s), 1)                   AS pct_on_time
+FROM core.fact_stop_event AS f
+JOIN core.dim_line AS l ON l.line_key = f.line_key
+JOIN core.dim_date AS d ON d.date = f.betriebstag
+WHERE f.betriebstag >= DATE_SUB(CURRENT_DATE('Europe/Zurich'), INTERVAL 28 DAY)
+GROUP BY l.verkehrsmittel_text, d.weekday_name, d.iso_weekday
+ORDER BY l.verkehrsmittel_text, d.iso_weekday;
+```
+
+**Peak hours on working days.** Departures grouped by the hour of the planned
+departure (`dim_time_slot` in its departure role).
+
+```sql
+SELECT l.linien_text,
+       CASE WHEN t.slot_hour BETWEEN 6 AND 8 THEN '1 morning peak 06-09'
+            WHEN t.slot_hour BETWEEN 16 AND 18 THEN '2 evening peak 16-19'
+            ELSE '3 off-peak' END                         AS period,
+       COUNT(f.dep_delay_s)                               AS departures_measured,
+       ROUND(AVG(f.dep_delay_s) / 60, 2)                  AS avg_dep_delay_min,
+       ROUND(100 * COUNTIF(f.dep_delay_s >= 180)
+             / COUNT(f.dep_delay_s), 1)                   AS pct_late_3min_plus
+FROM core.fact_stop_event AS f
+JOIN core.dim_line AS l ON l.line_key = f.line_key
+JOIN core.dim_time_slot AS t ON t.slot_hour = f.dep_slot_hour
+JOIN core.dim_date AS d ON d.date = f.betriebstag
+WHERE f.betriebstag >= DATE_SUB(CURRENT_DATE('Europe/Zurich'), INTERVAL 28 DAY)
+  AND NOT d.is_weekend
+GROUP BY l.linien_text, period
+ORDER BY l.linien_text, period;
+```
+
+**Where the delay builds up.** Change of the delay between two consecutive stops of
+the same trip (arrival delay at the next stop minus departure delay at this stop).
+Positive values: the train loses time on this segment. This question needs the
+stop grain of the fact table; the mart only keeps medians per origin–destination
+pair.
+
+```sql
+SELECT l.linien_text,
+       sa.haltestellen_name                               AS from_stop,
+       sb.haltestellen_name                               AS to_stop,
+       COUNT(*)                                           AS segments,
+       ROUND(AVG(b.arr_delay_s - a.dep_delay_s) / 60, 2)  AS avg_delay_gain_min
+FROM core.fact_stop_event AS a
+JOIN core.fact_stop_event AS b
+  ON  b.betriebstag      = a.betriebstag
+  AND b.fahrt_bezeichner = a.fahrt_bezeichner
+  AND b.stop_sequence    = a.stop_sequence + 1
+JOIN core.dim_stop AS sa ON sa.stop_key = a.stop_key
+JOIN core.dim_stop AS sb ON sb.stop_key = b.stop_key
+JOIN core.dim_line AS l  ON l.line_key  = a.line_key
+WHERE a.betriebstag >= DATE_SUB(CURRENT_DATE('Europe/Zurich'), INTERVAL 28 DAY)
+  AND a.dep_delay_s IS NOT NULL
+  AND b.arr_delay_s IS NOT NULL
+GROUP BY l.linien_text, from_stop, to_stop
+HAVING COUNT(*) >= 20
+ORDER BY avg_delay_gain_min DESC
+LIMIT 10;
+```
+
 ## Design decisions
 
 **Transform stays in Python, modelling runs in BigQuery (ETL + ELT).**
