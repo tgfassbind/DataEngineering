@@ -97,17 +97,26 @@ of the range; the loop `load_days` then handles one day after the other:
 
 1. `load_stop_events`, `load_run_scope`: `LoadFromGcs` of the two Parquet files into
    `core.stg_stop_event` and `core.stg_run_scope` (`WRITE_TRUNCATE`);
-2. `load_core`: `bigquery/sql/10_load_core.sql` merges the dimensions and replaces
-   the day's processed lines in `core.fact_stop_event`, in one transaction.
+2. `load_core`: `bigquery/sql/10_load_core.sql` checks the load table (blocking
+   data-quality checks), merges the dimensions and replaces the day's processed
+   lines in `core.fact_stop_event`, in one transaction. A failed check stops the
+   flow; the day stays unchanged.
 
 Days run strictly one after the other (`concurrencyLimit: 1`), because the load
 tables are shared. Each task is retried up to 3 times (temporary BigQuery errors);
 all three are safe to repeat.
 
 **5. Data mart.** `refresh_mart` runs `bigquery/sql/20_refresh_mart.sql` once after
-the loop: `mart.mart_od_delay_by_slot` is recomputed in full. Retried up to 3 times.
+the loop: `mart.mart_od_delay_by_slot` is recomputed in full and checked before the
+commit; a failed check keeps the previous mart. Retried up to 3 times.
 
-**6. Summary.** Logs the fact rows and trips in the range and the size of the mart.
+**6. Data quality.** `quality_checks` runs `bigquery/sql/30_check_quality.sql` for the
+range (missing lines, unusual volumes, few measurements, old data). Findings are
+stored in `core.dq_check_result` and logged as warnings (`log_quality_warnings`);
+they do not fail the run. Details: [docs/data_quality.md](../docs/data_quality.md).
+
+**7. Summary.** Logs the fact rows and trips in the range, the size of the mart and
+the number of data-quality warnings.
 
 ### How Kestra starts the jobs
 
@@ -153,6 +162,8 @@ docker compose up -d --force-recreate kestra
 | `load_stop_events`: "Not found: URI gs://…" | the day was not transformed: run `transform_only` (or `full`) for it |
 | `load_core`: "Table … stg_… was not found" / dimension or fact table missing | run `setup_bigquery` once |
 | "Permission denied" / 403 in a BigQuery task | pipeline service account lacks BigQuery Job User or BigQuery Data Editor |
+| `load_core`: "Load stopped, nothing changed. Failed checks …" | blocking data-quality check, see [docs/data_quality.md](../docs/data_quality.md) |
+| `quality_checks`: "Table … dq_check_result was not found" | run `setup_bigquery` again (creates the new table) |
 
 ## Design decisions
 

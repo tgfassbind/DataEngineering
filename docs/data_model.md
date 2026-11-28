@@ -208,7 +208,8 @@ approximate `APPROX_QUANTILES`.
 | `dim_date`, `dim_time_slot` | generated once at setup | – |
 | `mart_od_delay_by_slot` | full recompute from fact + dims | idempotent |
 
-The SQL is in [`bigquery/sql/`](../bigquery/sql/). The load into `core` and the mart
+The SQL is in [`bigquery/sql/`](../bigquery/sql/). Data-quality checks of every
+step, incl. the results table `core.dq_check_result`: [data_quality.md](data_quality.md). The load into `core` and the mart
 refresh each run in one transaction; on an error nothing changes. BigQuery does not
 enforce primary keys, so the load checks the fact key of the load table first and
 stops without changes if it finds duplicates.
