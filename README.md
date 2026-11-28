@@ -72,73 +72,232 @@ Cross-cutting documentation:
 
 ## Setup
 
+> **Ran the earlier local version (Postgres) before?** Remove its containers and
+> volumes first, so that Kestra does not start on the old database. In the project
+> folder, ideally before `git pull`:
+>
+> ```bash
+> docker compose down -v --remove-orphans
+> ```
+>
+> This deletes only local data (the old Postgres tables and the Kestra execution
+> history). Files in the project folder (e.g. `dataset/`) and everything in Google
+> Cloud stay untouched.
+
 ### Prerequisites
 
-- A **Google Cloud project** with billing enabled (the free tier covers BigQuery at
-  this size; see [Costs](#costs))
+- A **Google Cloud project** with billing enabled (a billing account or the course
+  coupon)
 - **Terraform** ≥ 1.11.4 (see: https://developer.hashicorp.com/terraform/install)
 - **Docker Engine** with Docker Compose v2 (`docker compose version`)
-    - (Windows and macOS see: https://docs.docker.com/desktop/)
+    - (macOS see: https://docs.docker.com/desktop/)
     - (Linux see: https://docs.docker.com/engine/install/)
+    - (Windows see: https://docs.docker.com/desktop/setup/install/windows-install/)
 - **Git** (see: https://git-scm.com/downloads)
+- A text editor for the configuration files. The steps below use **nano**
+  (preinstalled on macOS and most Linux distributions); on Windows, **Notepad**.
 - Internet access (the fetcher downloads from opentransportdata.swiss)
 - Free local disk space for one monthly archive ZIP (about 1.5 GB) while a past
   month is fetched; the raw files themselves go straight to the bucket.
 
+Each step shows the commands for **macOS / Linux** (Terminal) and, where they
+differ, for **Windows PowerShell**. Commands without a Windows block are the same
+on both.
+
 ### 1. Clone
 
 ```bash
+cd ~
 git clone https://github.com/tgfassbind/DataEngineering.git
 cd DataEngineering
+pwd        # absolute path of the repo, needed in step 4
 ```
+
+The same commands work in PowerShell. There, `pwd` prints e.g.
+`C:\Users\til\DataEngineering`; step 4 needs it as `/c/Users/til/DataEngineering`.
 
 (or via SSH: `git clone git@github.com:tgfassbind/DataEngineering.git`)
 
-### 2. Service accounts
+### 2. Google Cloud: project ID and service accounts
 
-In the Google Cloud Console (**IAM & Admin → Service Accounts**) create two service
-accounts, each with a JSON key. Store the keys **outside the repository**, e.g. in
-`~/.config/deng/keys/`.
+**Project ID.** Terraform and the pipeline need the project **ID**, not the project
+name (they can differ, e.g. name `HSLU DENG`, ID `hslu-hs26-deng`). In the
+[Google Cloud Console](https://console.cloud.google.com/), click the project picker
+in the top bar (left of the search field): the dialog lists every project with
+**Name** and **ID**. The ID is also shown on the **Dashboard** in the card
+**Project info**. Note it down.
+
+**Service accounts.** In the Console, go to **IAM & Admin → Service Accounts →
+Create service account** and create two accounts with these roles:
 
 | Service account | Used by | Project roles |
 |---|---|---|
 | `terraform` | Terraform, from your terminal | Storage Admin, BigQuery Admin |
 | `pipeline` | Kestra, fetcher, transform | Storage Object User, Storage Bucket Viewer, BigQuery Job User, BigQuery Data Editor |
 
+For each account: open it → **Keys → Add key → Create new key → JSON**. The browser
+downloads a file named like `<project-id>-<12 characters>.json`. Note which file
+belongs to which account.
+
+Move both keys **outside the repository**, into one folder:
+
+macOS / Linux:
+
+```bash
+mkdir -p ~/.config/deng/keys
+mv ~/Downloads/<terraform-key-file>.json ~/.config/deng/keys/
+mv ~/Downloads/<pipeline-key-file>.json ~/.config/deng/keys/
+ls ~/.config/deng/keys/        # both files listed
+```
+
+Windows PowerShell:
+
+```powershell
+mkdir $HOME\.config\deng\keys
+mv $HOME\Downloads\<terraform-key-file>.json $HOME\.config\deng\keys\
+mv $HOME\Downloads\<pipeline-key-file>.json $HOME\.config\deng\keys\
+ls $HOME\.config\deng\keys\       # both files listed
+```
+
+Tip: type the first letters of a file name and press **Tab** to complete it.
+
 Details and reasoning: [terraform/README.md](terraform/README.md).
 
 ### 3. Cloud infrastructure
 
+Point Terraform to the **terraform** key. Use the full path and complete the file
+name with **Tab**:
+
+macOS / Linux:
+
 ```bash
 cd terraform
-export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/deng/keys/terraform.json"
-cp terraform.tfvars.example terraform.tfvars   # set project_id and bucket_name
+export GOOGLE_APPLICATION_CREDENTIALS=$HOME/.config/deng/keys/<terraform-key-file>.json
+ls -l $GOOGLE_APPLICATION_CREDENTIALS      # must list the file, not "No such file"
+```
+
+Windows PowerShell (the quotes are needed here; Tab completion works inside them):
+
+```powershell
+cd terraform
+$env:GOOGLE_APPLICATION_CREDENTIALS = "$HOME\.config\deng\keys\<terraform-key-file>.json"
+Test-Path $env:GOOGLE_APPLICATION_CREDENTIALS     # must print True
+```
+
+The variable is only set in this terminal window. In a new window, set it again
+before using Terraform.
+
+Create your Terraform settings from the template and edit them.
+
+macOS / Linux:
+
+```bash
+cp terraform.tfvars.example terraform.tfvars
+nano terraform.tfvars
+```
+
+Windows PowerShell:
+
+```powershell
+cp terraform.tfvars.example terraform.tfvars
+notepad terraform.tfvars
+```
+
+Replace `YOUR_PROJECT_ID` with your project ID, in both lines:
+
+```hcl
+project_id  = "hslu-hs26-deng"
+bucket_name = "hslu-hs26-deng-lake" # must be globally unique
+location    = "EU"
+```
+
+nano: save with **Ctrl+O**, **Enter**, exit with **Ctrl+X**. Notepad: save with
+**Ctrl+S** and close the window. Keep the quotes: in this file they are required. If Terraform later reports that the bucket name is taken,
+choose another one, e.g. with a suffix.
+
+```bash
 terraform init
 terraform plan        # 3 to add: bucket, datasets core and mart
-terraform apply
+terraform apply       # type "yes" when asked
 terraform output      # bucket_url, datasets
 cd ..
 ```
 
 ### 4. Configure
 
+Create the configuration from the template and open it.
+
+macOS / Linux:
+
 ```bash
 cp .env.example .env
+nano .env
 ```
 
-Set at least:
+Windows PowerShell:
 
-| Variable | Why |
+```powershell
+cp .env.example .env
+notepad .env
+```
+
+`.env` is a hidden file: it does not show up in Finder / Explorer by default. Edit it
+with nano, Notepad or a code editor, not with TextEdit or Word: they can replace
+straight quotes with typographic ones and break the file. Notepad keeps the name
+`.env` when saving (no `.txt`).
+
+Set at least these values (example):
+
+```dotenv
+GCS_BUCKET=hslu-hs26-deng-lake
+GCP_PROJECT_ID=hslu-hs26-deng
+GCP_LOCATION=EU
+GCP_PIPELINE_KEY_FILE=/Users/til/.config/deng/keys/hslu-hs26-deng-0123456789ab.json
+HOST_PROJECT_DIR=/Users/til/DataEngineering
+KESTRA_BASIC_AUTH_USERNAME=til@example.com
+KESTRA_BASIC_AUTH_PASSWORD=MyKestra2026
+KESTRA_DB_PASSWORD=a-long-random-password
+```
+
+**On Windows**, write both paths with forward slashes and `/c/` instead of `C:\`:
+
+```dotenv
+GCP_PIPELINE_KEY_FILE=/c/Users/til/.config/deng/keys/hslu-hs26-deng-0123456789ab.json
+HOST_PROJECT_DIR=/c/Users/til/DataEngineering
+```
+
+Kestra starts the jobs through Docker and mounts the repo under the same path inside
+a Linux container, where `C:\...` is not a valid path. Docker Desktop translates
+`/c/Users/...` to the Windows drive.
+
+| Variable | What to enter |
 |---|---|
-| `GCS_BUCKET` | Bucket name: Terraform output `bucket_url` without `gs://`. |
-| `GCP_PROJECT_ID` | Your Google Cloud project ID. |
-| `GCP_LOCATION` | Location of bucket and datasets (Terraform `location`, default `EU`). |
-| `GCP_PIPELINE_KEY_FILE` | Absolute path of the **pipeline** service account's JSON key. It is mounted read-only into the containers. |
-| `HOST_PROJECT_DIR` | Absolute path of this repo on the host (`pwd`). Kestra starts the jobs with `docker compose run` and needs the repo mounted under the identical path. |
+| `GCS_BUCKET` | `bucket_url` from `terraform output`, without `gs://`. |
+| `GCP_PROJECT_ID` | Your project ID (step 2). |
+| `GCP_LOCATION` | Same as `location` in `terraform.tfvars` (default `EU`). |
+| `GCP_PIPELINE_KEY_FILE` | Full path of the **pipeline** key (not the Terraform key). Write the path out: `~` and `$HOME` do not work here. Get it with `ls ~/.config/deng/keys/*` (macOS: `/Users/<you>/...`, Linux: `/home/<you>/...`, Windows: `/c/Users/<you>/...`). |
+| `HOST_PROJECT_DIR` | Output of `pwd` in the repo folder (step 1), no trailing `/`. Kestra starts the jobs with `docker compose run` and needs the repo under the identical path. |
 | `KESTRA_BASIC_AUTH_USERNAME` / `KESTRA_BASIC_AUTH_PASSWORD` | Kestra login. The user name must be an e-mail address. The password needs ≥ 8 characters with upper case, lower case and a digit. |
-| `KESTRA_DB_PASSWORD` | Password of Kestra's own metadata database. |
+| `KESTRA_DB_PASSWORD` | Password of Kestra's own metadata database. **Set it before the first start** and do not change it afterwards (see [Troubleshooting](#troubleshooting)). |
 
-All other values have working defaults and are explained in `.env.example`.
+No quotes are needed in `.env`. Avoid `$` in passwords: Docker Compose reads it as
+the start of a variable. All other values have working defaults and are explained
+in `.env.example`.
+
+Save (nano: **Ctrl+O**, **Enter**, **Ctrl+X**; Notepad: **Ctrl+S**) and check that
+Compose reads the file without errors.
+
+macOS / Linux:
+
+```bash
+docker compose config --quiet && echo "configuration OK"
+```
+
+Windows PowerShell (no output means OK):
+
+```powershell
+docker compose config --quiet
+```
 
 ### 5. Build and start
 
@@ -158,13 +317,17 @@ Open <http://localhost:8080>, log in, go to **Flows → namespace `deng` →
 dimensions; the last log line shows the number of tables in `core` and `mart` and the
 rows of `dim_date` (6574) and `dim_time_slot` (24). Safe to rerun.
 
+> **Note:** The Kestra UI sometimes shows that it has lost the connection to the
+> server. Reload the browser window; running executions are not affected.
+
 ### 7. Load data
 
 **Option A – Kestra (normal operation)**
 
 Execute **`backfill`** with a date range, e.g. `2026-09-01` to `2026-09-07`,
 mode `full`. Each run fetches, transforms and loads every day of the range, then
-refreshes the data mart and runs the data-quality checks.
+refreshes the data mart and runs the data-quality checks. The example week takes
+about 7 minutes (mostly the download of the archive).
 
 From then on, the `daily` flow processes yesterday's data every morning
 (06:15 Europe/Zurich), as long as Kestra is running.
@@ -205,7 +368,19 @@ To fully rebuild a day after the source data was corrected: `full` with
 
 ### 8. Check the result
 
-In BigQuery Studio:
+**Running a query in BigQuery Studio**
+
+1. Open <https://console.cloud.google.com/bigquery> and select your project in the
+   project picker at the top (the same project ID as in `.env`).
+2. In the **Explorer** on the left, open your project: the datasets `core` and
+   `mart` are listed with their tables.
+3. Click **+** (or **Compose new query**) to open an empty query tab.
+4. Paste the query and click **Run**. The result appears below the editor.
+
+The queries name the tables as `dataset.table` (e.g. `mart.mart_od_delay_by_slot`);
+BigQuery adds the selected project. All queries in this README run this way.
+
+The data mart must return rows:
 
 ```sql
 SELECT linien_text, from_stop, to_stop, weekday, slot_hour,
@@ -215,6 +390,8 @@ WHERE from_stop = 'Rotkreuz'
 ORDER BY linien_text, to_stop, weekday, slot_hour
 LIMIT 20;
 ```
+
+The exact values are checked in the [Verification](#verification).
 
 Data-quality findings of the last run:
 
@@ -227,20 +404,19 @@ ORDER BY status DESC, check_name;
 
 More queries: [docs/data_quality.md](docs/data_quality.md#queries).
 
-## Costs
+### Troubleshooting
 
-Nothing runs permanently in Google Cloud: the jobs and Kestra run locally, the cloud
-only stores data and runs BigQuery jobs.
+| Symptom | Cause and fix |
+|---|---|
+| `kestra` restarts, log shows `password authentication failed for user "kestra"` or `Connection to kestra-db … refused` | The Kestra database is created **once**, with the password in `.env` at the first start. A later change of `KESTRA_DB_PASSWORD` (or `KESTRA_DB_USER` / `KESTRA_DB_NAME`) does not reach the existing database. Either set the old values again, or reset Kestra's metadata (flows are reloaded from the repo, the execution history is lost): `docker compose down -v` then `docker compose up -d`. |
+| Same error after cloning the repo a **second time** on the same machine (e.g. for another Google Cloud project) | Both clones use the same Compose project name and therefore the same containers and volumes, incl. the Kestra database of the first clone. Stop the first one (`docker compose down` in its folder), or give the second clone its own name and port in `.env`: `COMPOSE_PROJECT_NAME=deng-datapipeline-2` and `KESTRA_UI_PORT=8081`. |
+| `docker compose` reports `set GCP_PIPELINE_KEY_FILE …` or `bind source path does not exist` | `GCP_PIPELINE_KEY_FILE` is empty, not an absolute path, or contains `~`. Write the full path (step 4). |
+| `docker compose` reports `port is already allocated` | Port 8080 is in use. Set another `KESTRA_UI_PORT` in `.env`. |
+| A Kestra task fails with `Permission denied` / `403` | The pipeline service account lacks a role (step 2), or `GCP_PIPELINE_KEY_FILE` points to the Terraform key. |
+| Kestra UI shows that the connection to the server was lost | Reload the browser window. Running executions are not affected. |
+| `terraform plan`: `could not find default credentials` | `GOOGLE_APPLICATION_CREDENTIALS` is not set in this terminal; set it again as in step 3 (`export` or `$env:`). |
 
-- **Cloud Storage:** the raw files are kept unchanged, about 650 MB per operating
-  day (about 20 GB per month). Billed per GB and month; see
-  [Cloud Storage pricing](https://cloud.google.com/storage/pricing).
-- **BigQuery:** only the selected lines are loaded (a few thousand rows per day);
-  storage and queries stay far inside the monthly free tier.
-
-We recommend a budget alert (**Billing → Budgets & alerts**). To remove everything
-after the project: empty the bucket, then `terraform destroy` (it refuses to delete
-a bucket or dataset that still contains data).
+More error messages of the flows: [orchestrator/README.md](orchestrator/README.md).
 
 ## Verification
 
@@ -249,9 +425,13 @@ Checks that your setup works and produces the same data as ours.
 ### 1. Infrastructure and stack
 
 ```bash
-cd terraform && terraform plan && cd ..   # "No changes."
-docker compose ps                         # kestra-db and kestra healthy
+cd terraform
+terraform plan        # "No changes."
+cd ..
+docker compose ps     # kestra-db and kestra healthy
 ```
+
+On Windows, set `$env:GOOGLE_APPLICATION_CREDENTIALS` first (setup step 3).
 
 In Kestra, the flows `daily`, `backfill` and `setup_bigquery` are listed in namespace
 `deng`, and `setup_bigquery` ran green.
@@ -261,13 +441,24 @@ In Kestra, the flows `daily`, `backfill` and `setup_bigquery` are listed in name
 Loads a fixed, closed week through Kestra. Past months come from the monthly
 archive, so every team downloads the same files.
 
+> If you already loaded `2026-09-01` to `2026-09-07` with mode `full` in setup
+> step 7, skip this run and continue with the checks below.
+
 Execute `backfill` with `start_date = 2026-09-01`, `end_date = 2026-09-07`,
 `mode = full`, `force_overwrite = false`, `lines` empty. All tasks must be green.
 
 **Raw files**
 
+macOS / Linux:
+
 ```bash
 docker compose run --rm --entrypoint python fetcher -m app.inventory | grep '2026-09-0[1-7]'
+```
+
+Windows PowerShell:
+
+```powershell
+docker compose run --rm --entrypoint python fetcher -m app.inventory | Select-String '2026-09-0[1-7]'
 ```
 
 The filter keeps the reference week, so other loaded days do not matter.
@@ -472,7 +663,7 @@ shows where to look.
 - **Warnings are not sent.** Monitoring findings are logged in Kestra and stored in
   `core.dq_check_result`; nobody is notified.
 - **Raw files grow without limit.** About 650 MB per day, no lifecycle rule on the
-  bucket (see [Costs](#costs)).
+  bucket.
 - **The mart is always recomputed in full.** Fine at the current size; time and
   scanned data grow with the history.
 - **Service account keys as JSON files.** As in class; rotating and storing them
