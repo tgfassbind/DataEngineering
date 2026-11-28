@@ -431,6 +431,56 @@ FROM (SELECT line_key, from_stop_key, to_stop_key, weekday, slot_hour
 If a check differs, the first layer that differs (raw → fact → dimensions → mart)
 shows where to look.
 
+## Known limitations
+
+**Data product**
+
+- **Only served stops.** Cancelled stops are excluded by design, so a line with
+  many cancellations looks more reliable than it is
+  ([data model](docs/data_model.md#design-decisions)).
+- **Extreme delays are dropped.** Delays over 3 h and segments over 6 h are treated
+  as invalid measurements. Real major disruptions are missing, the medians tend to
+  be slightly optimistic ([transform](transform/README.md)).
+- **Small groups.** Some combinations of line, stop pair, weekday and hour rest on
+  few measurements; the app should show `n_dep_obs` / `n_arr_obs` with the median.
+- **All loaded days count equally.** No weighting by age and no distinction of
+  holidays or timetable periods; after the timetable change in December, old and
+  new timetable mix.
+- **Only the configured lines** (IR75 and S1 via Rotkreuz). Another line needs an
+  entry in `transform/config/lines.yml` and a `transform_only` run for its days.
+
+**Data and model**
+
+- **Removed lines stay.** A line removed from `lines.yml` keeps its rows in the fact
+  table and the mart until they are deleted by hand.
+- **No history of names.** Stops and lines are SCD type 1: a renamed stop replaces
+  the old name.
+- **Source corrections need a re-fetch.** A corrected source file reaches BigQuery
+  only after the day is fetched again with `force_overwrite`.
+- **Schema changes are manual.** `CREATE TABLE IF NOT EXISTS` does not change an
+  existing table; a new column needs a migration.
+- **No automated tests for the BigQuery SQL.** Fetcher and transform have unit and
+  end-to-end tests; the SQL is covered by the blocking checks and the reference week
+  of the [verification](#verification).
+
+**Operations and infrastructure**
+
+- **Kestra runs locally.** `daily` runs only while the machine and Docker are up;
+  missed days are caught up at the next start.
+- **One run at a time.** A long backfill delays `daily` until it is done.
+- **Warnings are not sent.** Monitoring findings are logged in Kestra and stored in
+  `core.dq_check_result`; nobody is notified.
+- **Raw files grow without limit.** About 650 MB per day, no lifecycle rule on the
+  bucket (see [Costs](#costs)).
+- **The mart is always recomputed in full.** Fine at the current size; time and
+  scanned data grow with the history.
+- **Service account keys as JSON files.** As in class; rotating and storing them
+  safely is manual. In production, keyless authentication (e.g. Workload Identity)
+  would be preferable.
+- **Archive ZIP on local disk.** Past months are downloaded as one ZIP to a temporary
+  local folder before the days are uploaded (agreed with the lecturer as temporary
+  processing); this needs about 1.5 GB of free space.
+
 ## Use of AI
 
 We used Claude (Anthropic) as an assistant throughout the project.
